@@ -378,8 +378,9 @@ local function displayStagedMessage(vehId, raceName, getMessage)
     elseif bestTime > targetTime then
       if careerMode then
         local adjustedBaseReward = raceReward(targetTime, reward, targetTime, raceData and raceData.type or nil)
-        return string.format("%sYour Best Time: %s | Target Time: %s\n(Achieve target to earn a reward of $%.2f)",
-          label, formatTime(bestTime), formatTime(targetTime), adjustedBaseReward)
+        return string.format(
+          "%sYour Best Time: %s | Target Time: %s\n(Achieve target to earn a reward of $%.2f)", label,
+          formatTime(bestTime), formatTime(targetTime), adjustedBaseReward)
       else
         return string.format("%sYour Best Time: %s | Target Time: %s", label, formatTime(bestTime),
           formatTime(targetTime))
@@ -448,16 +449,16 @@ local function displayStagedMessage(vehId, raceName, getMessage)
           "Your Best Speed: %.2f mph | Target Speed: %.2f mph\nYour Best Time: %s\n(Improve to earn at least $%.2f)",
           bestSpeed, targetSpeed, formatTime(bestTime), adjustedReward)
       else
-        message = message ..
-                    string.format("Your Best Speed: %.2f mph | Target Speed: %.2f mph\nYour Best Time: %s", bestSpeed,
-            targetSpeed, formatTime(bestTime))
+        message = message .. string.format(
+          "Your Best Speed: %.2f mph | Target Speed: %.2f mph\nYour Best Time: %s",
+          bestSpeed, targetSpeed, formatTime(bestTime))
       end
     else
       if careerMode then
         local adjustedReward = topSpeedReward(targetSpeed, race.reward, targetSpeed, race.type)
-        message = message ..
-                    string.format("Target Speed: %.2f mph\n(Achieve this to earn a reward of $%.2f and 1 Bonus Star)",
-            targetSpeed, adjustedReward)
+        message = message .. string.format(
+          "Target Speed: %.2f mph\n(Achieve this to earn a reward of $%.2f and 1 Bonus Star)",
+          targetSpeed, adjustedReward)
       else
         message = message .. string.format("Target Speed: %.2f mph", targetSpeed)
       end

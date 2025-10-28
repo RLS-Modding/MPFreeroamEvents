@@ -152,63 +152,85 @@ end
 
 local function enableCheckpoint(checkpointIndex, alt)
     resetActiveCheckpoints()
-    local ALT = {alt, alt}
-    local index = {checkpointIndex, checkpointIndex + 1}
-    if isLoop then
-        index = {index[1] % #checkpoints + 1, index[2] % #checkpoints + 1}
+
+    local expectedIndex
+
+    -- This logic cleanly separates the two states.
+    if mAltRoute then
+        -- SCENARIO 1: We are currently on an alternate route.
+        expectedIndex = checkpointIndex + 1
+        
+        -- The next checkpoint to display MUST be blue.
+        local currentCp = altCheckpoints and altCheckpoints[expectedIndex]
+        if currentCp then
+            if not currentCp.marker then createCheckpointMarker(expectedIndex, true) end
+            currentCp.marker.instanceColor = ColorF(0, 0, 1, 0.7):asLinear4F() -- Blue
+        end
+
+        -- The preview checkpoint (red) must also be from the alt route.
+        local previewIndex = expectedIndex + 1
+        local previewCp = altCheckpoints and altCheckpoints[previewIndex]
+        if previewCp then
+            if not previewCp.marker then createCheckpointMarker(previewIndex, true) end
+            previewCp.marker.instanceColor = ColorF(1, 0, 0, 0.5):asLinear4F() -- Red
+        end
+
     else
-        index = {index[1] + 1, index[2] + 1}
-    end
-    for i = 1, 2 do
-        if ALT[i] then
-            if #altCheckpoints < index[i] then
-                index[i] = race.altRoute.mergeCheckpoints[2] + ((index[i] - 1) - #altCheckpoints)
-                ALT[i] = false
+        -- SCENARIO 2: We are currently on the main route.
+        expectedIndex = checkpointIndex + 1
+
+        -- The next checkpoint to display MUST be green.
+        local currentCp = checkpoints and checkpoints[expectedIndex]
+        if currentCp then
+            if not currentCp.marker then createCheckpointMarker(expectedIndex, false) end
+            currentCp.marker.instanceColor = ColorF(0, 1, 0, 0.7):asLinear4F() -- Green
+        end
+
+        -- The preview checkpoint (red) must also be from the main route.
+        local previewIndex = expectedIndex + 1
+        local previewCp = checkpoints and checkpoints[previewIndex]
+        if previewCp then
+            if not previewCp.marker then createCheckpointMarker(previewIndex, false) end
+            previewCp.marker.instanceColor = ColorF(1, 0, 0, 0.5):asLinear4F() -- Red
+        end
+
+        -- BACKWARDS COMPATIBILITY: If this is a classic race, ALSO show the first blue checkpoint.
+        if race and race.altRoute and not race.forks and #altCheckpoints > 0 then
+            local altStartCp = altCheckpoints[1]
+            if altStartCp then
+                if not altStartCp.marker then createCheckpointMarker(1, true) end
+                altStartCp.marker.instanceColor = ColorF(0, 0, 1, 0.7):asLinear4F() -- Blue
             end
         end
     end
-    local currentExpectedCheckpoint = index[1]
-    local checkpoint = {}
-    if ALT[1] then
-        checkpoint = altCheckpoints[index[1]]
-    else
-        checkpoint = checkpoints[index[1]]
-    end
-    local nextCheckpoint = nil
-    local checkpointCount = ALT[2] and #altCheckpoints or #checkpoints
-    if checkpointCount > 1 then
-        if ALT[2] then
-            nextCheckpoint = altCheckpoints[index[2]]
-        else
-            nextCheckpoint = checkpoints[index[2]]
+
+    return expectedIndex
+end
+
+local function enableForkCheckpoints(mainIndex, altIndex, raceData)
+    resetActiveCheckpoints()
+    
+    local mainCp = checkpoints[mainIndex]
+    local altCp = altCheckpoints[altIndex]
+
+    if mainCp then
+        if not mainCp.marker then
+            mainCp = createCheckpointMarker(mainIndex, false)
         end
+        -- Color for a choice, e.g., blue
+        mainCp.marker.instanceColor = ColorF(0, 0, 1, 0.7):asLinear4F() 
     end
 
-    if checkpoint then
-        if not checkpoint.marker then
-            checkpoint = createCheckpointMarker(index[1], ALT[1])
+    if altCp then
+        if not altCp.marker then
+            altCp = createCheckpointMarker(altIndex, true)
         end
-        if not ALT[1] then
-            checkpoint.marker.instanceColor = ColorF(0, 1, 0, 0.7):asLinear4F() -- Green
-        else
-            checkpoint.marker.instanceColor = ColorF(0, 0, 1, 0.7):asLinear4F() -- Blue
-        end
-
-        if race.altRoute and altCheckpoints and race.altRoute.mergeCheckpoints[1] == index[1] then
-            if not altCheckpoints[1].marker then
-                local altCheckpoint = createCheckpointMarker(1, true)
-                altCheckpoint.marker.instanceColor = ColorF(0, 0, 1, 0.7):asLinear4F() -- Blue
-            end
-        end
-
-        if nextCheckpoint then
-            if not nextCheckpoint.marker then
-                nextCheckpoint = createCheckpointMarker(index[2], ALT[2])
-            end
-            nextCheckpoint.marker.instanceColor = ColorF(1, 0, 0, 0.5):asLinear4F() -- Red
-        end
+        -- Color for a choice, e.g., blue
+        altCp.marker.instanceColor = ColorF(0, 0, 1, 0.7):asLinear4F()
     end
-    return currentExpectedCheckpoint
+
+    -- Return the valid next checkpoint indexes
+    return { main = mainIndex, alt = altIndex }
 end
 
 local function removeCheckpoints()
@@ -255,24 +277,32 @@ local function removeCheckpoints()
     mAltRoute = nil
 end
 
-local function calculateTotalCheckpoints()
+local function calculateTotalCheckpoints(raceData)
     local mainCount = #checkpoints
     local altCount = altCheckpoints and #altCheckpoints or 0
-    local mergePoints = race.altRoute and race.altRoute.mergeCheckpoints or {0, 0}
 
-    -- If the player is on the alt route, adjust total checkpoints accordingly
-    local total
-    if mAltRoute then
-        total = altCount + (mainCount - mergePoints[2] + mergePoints[1])
+    if mAltRoute and raceData then
+        -- Check which kind of alt route we're on
+        if raceData.forks then
+            -- SCENARIO 1: It's our new "fork" system
+            local forkData = raceData.forks[1] -- Assumes one fork for now
+            return forkData.atMainIndex + altCount
+        elseif raceData.altRoute and raceData.altRoute.mergeCheckpoints then
+            -- SCENARIO 2: It's a classic "altRoute" with a merge point
+            local mergePoints = raceData.altRoute.mergeCheckpoints
+            -- It calculates: (total alt CPs) + (main CPs after the merge) - (main CPs that were skipped)
+            return altCount + (mainCount - mergePoints[2]) + 1
+        else
+            -- Fallback for a weirdly defined alt route
+            return altCount
+        end
     else
-        total = mainCount
+        -- SCENARIO 3: We're on the main route
+        return mainCount
     end
-
-    return total
 end
 
 local function setAltRoute(altRoute)
-    mAltRoute = altRoute
 end
 
 local function setRace(inputRace, inputRaceName)
@@ -287,6 +317,7 @@ end
 M.onExtensionLoaded = onExtensionLoaded
 M.createCheckpoints = createCheckpoints
 M.enableCheckpoint = enableCheckpoint
+M.enableForkCheckpoints = enableForkCheckpoints
 M.removeCheckpoints = removeCheckpoints
 M.setAltRoute = setAltRoute
 M.setRace = setRace
