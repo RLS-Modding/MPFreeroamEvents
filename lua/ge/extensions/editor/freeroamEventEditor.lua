@@ -618,7 +618,7 @@ local function teleportToStart(raceName)
     
     -- Place vehicle behind staging (offset back along the approach direction)
     local stagingScale = stagingTrigger:getScale()
-    local offset = math.max(stagingScale.x, stagingScale.y) + 8 -- behind staging zone + some room
+    local offset = math.max(stagingScale.x, stagingScale.y) + 2 -- just behind staging zone
     local spawnPos = stagingPos - dir * offset
     
     -- Snap to ground using surface height
