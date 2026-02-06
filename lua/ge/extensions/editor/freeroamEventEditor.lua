@@ -732,60 +732,151 @@ end
 local function drawRewardCurve(race)
   if not race.bestTime or not race.reward then return end
   
+  local rewardCap = race.reward * 30  -- MAX_REWARD_MULTIPLIER from utils
   local numPoints = 50
-  local rewardTable = {}
-  local minTime = race.bestTime * 0.5
-  local maxTime = race.bestTime * 2.0
-  local timeStep = (maxTime - minTime) / (numPoints - 1)
   
+  -- For damage-based events, show TWO curves: one for time (at current damage%), one for damage (at current time)
+  if race.damageFactor and race.damageFactor > 0 then
+    -- Time curve (varying time at fixed damage)
+    local timeTable = {}
+    local minTime = race.bestTime * 0.5
+    local maxTime = race.bestTime * 2.0
+    local timeStep = (maxTime - minTime) / (numPoints - 1)
+    local maxReward = 0
+    
+    for i = 0, numPoints - 1 do
+      local time = minTime + (i * timeStep)
+      local reward = utils.hybridRaceReward(race.bestTime, race.reward, time, race.damageFactor, damagePercentage[0], race.type)
+      reward = math.min(reward, rewardCap)
+      timeTable[i + 1] = reward
+      if reward > maxReward then maxReward = reward end
+    end
+    
+    -- Damage curve (varying damage at fixed time)
+    local damageTable = {}
+    local damageStep = 1.0 / (numPoints - 1)
+    local maxDamageReward = 0
+    
+    for i = 0, numPoints - 1 do
+      local dmg = i * damageStep
+      local reward = utils.hybridRaceReward(race.bestTime, race.reward, realTime[0] > 0 and realTime[0] or race.bestTime, race.damageFactor, dmg, race.type)
+      reward = math.min(reward, rewardCap)
+      damageTable[i + 1] = reward
+      if reward > maxDamageReward then maxDamageReward = reward end
+    end
+    
+    im.Text("Reward vs Time (at current damage %)")
+    local timeData = im.TableToArrayFloat(timeTable)
+    im.PlotLines1("##RewardTime", timeData, im.GetLengthArrayFloat(timeData), 0, 
+      string.format("Max $%.0f", maxReward), 0, math.max(maxReward * 1.1, 1), 
+      im.ImVec2(im.GetContentRegionAvail().x, 120))
+    im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
+    im.SameLine()
+    im.SetCursorPosX(im.GetContentRegionAvail().x * 0.45)
+    im.TextColored(colors.dimmed, string.format("%.1fs (target)", race.bestTime))
+    im.SameLine()
+    im.SetCursorPosX(im.GetContentRegionAvail().x * 0.85)
+    im.TextColored(colors.dimmed, string.format("%.1fs", maxTime))
+    
+    im.Spacing()
+    
+    im.Text("Reward vs Damage (at current time)")
+    local damageData = im.TableToArrayFloat(damageTable)
+    im.PlotLines1("##RewardDamage", damageData, im.GetLengthArrayFloat(damageData), 0, 
+      string.format("Max $%.0f", maxDamageReward), 0, math.max(maxDamageReward * 1.1, 1), 
+      im.ImVec2(im.GetContentRegionAvail().x, 120))
+    im.TextColored(colors.dimmed, "0% damage")
+    im.SameLine()
+    im.SetCursorPosX(im.GetContentRegionAvail().x * 0.85)
+    im.TextColored(colors.dimmed, "100% damage")
+    
+    -- Preview
+    local previewReward = utils.hybridRaceReward(race.bestTime, race.reward, realTime[0], race.damageFactor, damagePercentage[0], race.type)
+    previewReward = math.min(previewReward, rewardCap)
+    im.TextColored(colors.info, string.format("Preview: %.1fs at %.0f%% damage = $%.0f", realTime[0], damagePercentage[0] * 100, previewReward))
+    im.TextColored(colors.dimmed, string.format("Reward cap: $%.0f", rewardCap))
+    return
+  end
+  
+  -- Standard curve for non-damage events
+  local rewardTable = {}
+  local minTime, maxTime, timeStep
   local maxReward = 0
-  local previewTimeIndex = -1
   local previewReward = 0
   
-  for i = 0, numPoints - 1 do
-    local time = minTime + (i * timeStep)
-    local reward
+  if race.topSpeed then
+    -- For top speed: X axis = speed, not time
+    local goalSpeed = race.topSpeedGoal or 100
+    local minSpeed = goalSpeed * 0.5
+    local maxSpeed = goalSpeed * 2.0
+    local speedStep = (maxSpeed - minSpeed) / (numPoints - 1)
+    
+    for i = 0, numPoints - 1 do
+      local speed = minSpeed + (i * speedStep)
+      local reward = utils.topSpeedReward(goalSpeed, race.reward, speed, race.type)
+      reward = math.min(reward, rewardCap)
+      rewardTable[i + 1] = reward
+      if reward > maxReward then maxReward = reward end
+    end
+    
+    previewReward = utils.topSpeedReward(race.topSpeedGoal or 100, race.reward, topSpeedPreview[0], race.type)
+    previewReward = math.min(previewReward, rewardCap)
+    
+    im.Text("Reward Curve (Speed vs Reward)")
+    local rewardData = im.TableToArrayFloat(rewardTable)
+    im.PlotLines1("##RewardCurve", rewardData, im.GetLengthArrayFloat(rewardData), 0,
+      string.format("Max $%.0f", maxReward), 0, math.max(maxReward * 1.1, 1),
+      im.ImVec2(im.GetContentRegionAvail().x, 150))
+    im.TextColored(colors.dimmed, string.format("%.0f mph", (race.topSpeedGoal or 100) * 0.5))
+    im.SameLine()
+    im.SetCursorPosX(im.GetContentRegionAvail().x * 0.4)
+    im.TextColored(colors.dimmed, string.format("%.0f mph (target)", race.topSpeedGoal or 100))
+    im.SameLine()
+    im.SetCursorPosX(im.GetContentRegionAvail().x * 0.85)
+    im.TextColored(colors.dimmed, string.format("%.0f mph", (race.topSpeedGoal or 100) * 2))
+    im.TextColored(colors.info, string.format("Preview: %.0f mph = $%.0f", topSpeedPreview[0], previewReward))
+  else
+    -- Time-based (standard or drift)
+    minTime = race.bestTime * 0.5
+    maxTime = race.bestTime * 2.0
+    timeStep = (maxTime - minTime) / (numPoints - 1)
+    
+    for i = 0, numPoints - 1 do
+      local time = minTime + (i * timeStep)
+      local reward
+      if race.driftGoal then
+        reward = utils.driftReward(race, time, driftScore[0])
+      else
+        reward = utils.raceReward(race.bestTime, race.reward, time, race.type)
+      end
+      reward = math.min(reward, rewardCap)
+      rewardTable[i + 1] = reward
+      if reward > maxReward then maxReward = reward end
+    end
     
     if race.driftGoal then
-      reward = utils.driftReward(race, time, driftScore[0])
-    elseif race.topSpeed then
-      reward = utils.topSpeedReward(race.topSpeedGoal or 100, race.reward, topSpeedPreview[0], race.type)
-    elseif race.damageFactor and race.damageFactor > 0 then
-      reward = utils.hybridRaceReward(race.bestTime, race.reward, time, race.damageFactor, damagePercentage[0], race.type)
+      previewReward = utils.driftReward(race, realTime[0], driftScore[0])
     else
-      reward = utils.raceReward(race.bestTime, race.reward, time, race.type)
+      previewReward = utils.raceReward(race.bestTime, race.reward, realTime[0], race.type)
     end
+    previewReward = math.min(previewReward, rewardCap)
     
-    rewardTable[i + 1] = reward
-    if reward > maxReward then maxReward = reward end
-    
-    -- Find closest point to preview time
-    if math.abs(time - realTime[0]) < timeStep then
-      previewTimeIndex = i
-      previewReward = reward
-    end
-  end
-  
-  -- Scale label
-  local scaleMax = string.format("$%.0f", maxReward)
-  
-  im.Text("Reward Curve (Time vs Reward)")
-  local rewardData = im.TableToArrayFloat(rewardTable)
-  im.PlotLines1("##RewardCurve", rewardData, im.GetLengthArrayFloat(rewardData), 0, scaleMax, 0, maxReward * 1.1, im.ImVec2(im.GetContentRegionAvail().x, 150))
-  
-  -- Time axis labels
-  im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
-  im.SameLine()
-  im.SetCursorPosX(im.GetContentRegionAvail().x * 0.45)
-  im.TextColored(colors.dimmed, string.format("%.1fs (target)", race.bestTime))
-  im.SameLine()
-  im.SetCursorPosX(im.GetContentRegionAvail().x * 0.9)
-  im.TextColored(colors.dimmed, string.format("%.1fs", maxTime))
-  
-  -- Show preview marker info
-  if previewTimeIndex >= 0 then
+    im.Text("Reward Curve (Time vs Reward)")
+    local rewardData = im.TableToArrayFloat(rewardTable)
+    im.PlotLines1("##RewardCurve", rewardData, im.GetLengthArrayFloat(rewardData), 0,
+      string.format("Max $%.0f", maxReward), 0, math.max(maxReward * 1.1, 1),
+      im.ImVec2(im.GetContentRegionAvail().x, 150))
+    im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
+    im.SameLine()
+    im.SetCursorPosX(im.GetContentRegionAvail().x * 0.45)
+    im.TextColored(colors.dimmed, string.format("%.1fs (target)", race.bestTime))
+    im.SameLine()
+    im.SetCursorPosX(im.GetContentRegionAvail().x * 0.85)
+    im.TextColored(colors.dimmed, string.format("%.1fs", maxTime))
     im.TextColored(colors.info, string.format("Preview: %.1fs = $%.0f", realTime[0], previewReward))
   end
+  
+  im.TextColored(colors.dimmed, string.format("Reward cap: $%.0f", rewardCap))
 end
 
 -- ============================================================================
