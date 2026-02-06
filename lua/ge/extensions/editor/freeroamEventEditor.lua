@@ -1540,7 +1540,7 @@ local function onEditorGui()
           im.Text("Damage %")
           im.TableSetColumnIndex(1)
           im.SetNextItemWidth(-1)
-          im.SliderFloat("##previewDamage", damagePercentage, 0.0, 1.0, "%.0f%%")
+          im.SliderFloat("##previewDamage", damagePercentage, 0.0, 1.0, "%.2f%%")
         end
         
         -- Lap count
