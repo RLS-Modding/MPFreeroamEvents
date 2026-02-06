@@ -897,24 +897,38 @@ local function drawRewardCurve(race)
   local rewardCap = race.reward * 30  -- MAX_REWARD_MULTIPLIER from utils
   local numPoints = 50
   
-  -- For damage-based events, show TWO curves: one for time (at current damage%), one for damage (at current time)
+  -- For damage-based events
   if race.damageFactor and race.damageFactor > 0 then
-    -- Time curve (varying time at fixed damage)
-    local timeTable = {}
-    local minTime = race.bestTime * 0.5
-    local maxTime = race.bestTime * 2.0
-    local timeStep = (maxTime - minTime) / (numPoints - 1)
-    local maxReward = 0
-    
-    for i = 0, numPoints - 1 do
-      local time = minTime + (i * timeStep)
-      local reward = utils.hybridRaceReward(race.bestTime, race.reward, time, race.damageFactor, damagePercentage[0], race.type)
-      reward = math.min(reward, rewardCap)
-      timeTable[i + 1] = reward
-      if reward > maxReward then maxReward = reward end
+    -- Time curve only shown when damageFactor < 1 (at factor 1, time has no effect)
+    if race.damageFactor < 1 then
+      local timeTable = {}
+      local minTime = race.bestTime * 0.5
+      local maxTime = race.bestTime * 2.0
+      local timeStep = (maxTime - minTime) / (numPoints - 1)
+      local maxReward = 0
+      
+      for i = 0, numPoints - 1 do
+        local time = minTime + (i * timeStep)
+        local reward = utils.hybridRaceReward(race.bestTime, race.reward, time, race.damageFactor, damagePercentage[0], race.type)
+        reward = math.min(reward, rewardCap)
+        timeTable[i + 1] = reward
+        if reward > maxReward then maxReward = reward end
+      end
+      
+      im.Text(string.format("Reward vs Time (at %.0f%% damage, factor: %.2f)", damagePercentage[0] * 100, race.damageFactor))
+      drawPlot("##RewardTime", timeTable, maxReward, 120)
+      im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
+      im.SameLine()
+      im.SetCursorPosX(im.GetContentRegionAvail().x * 0.45)
+      im.TextColored(colors.dimmed, string.format("%.1fs (target)", race.bestTime))
+      im.SameLine()
+      im.SetCursorPosX(im.GetContentRegionAvail().x * 0.85)
+      im.TextColored(colors.dimmed, string.format("%.1fs", maxTime))
+      
+      im.Spacing()
     end
     
-    -- Damage curve (varying damage at fixed time)
+    -- Damage curve (always shown for damage-based events)
     local damageTable = {}
     local damageStep = 1.0 / (numPoints - 1)
     local maxDamageReward = 0
@@ -927,20 +941,8 @@ local function drawRewardCurve(race)
       if reward > maxDamageReward then maxDamageReward = reward end
     end
     
-    im.Text(string.format("Reward vs Time (at %.0f%% damage, factor: %.2f)", damagePercentage[0] * 100, race.damageFactor))
-    drawPlot("##RewardTime", timeTable, maxReward, 120)
-    im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
-    im.SameLine()
-    im.SetCursorPosX(im.GetContentRegionAvail().x * 0.45)
-    im.TextColored(colors.dimmed, string.format("%.1fs (target)", race.bestTime))
-    im.SameLine()
-    im.SetCursorPosX(im.GetContentRegionAvail().x * 0.85)
-    im.TextColored(colors.dimmed, string.format("%.1fs", maxTime))
-    
-    im.Spacing()
-    
     local previewTime = realTime[0] > 0 and realTime[0] or race.bestTime
-    im.Text(string.format("Reward vs Damage (at %.1fs, factor: %.2f)", previewTime, race.damageFactor))
+    im.Text(string.format("Reward vs Damage%s", race.damageFactor < 1 and string.format(" (at %.1fs, factor: %.2f)", previewTime, race.damageFactor) or " (damage only)"))
     drawPlot("##RewardDamage", damageTable, maxDamageReward, 120)
     im.TextColored(colors.dimmed, "0% damage")
     im.SameLine()
