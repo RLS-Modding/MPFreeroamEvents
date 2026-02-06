@@ -171,6 +171,21 @@ local function formatTime(seconds)
   return string.format("%s%02d:%02d:%02d", sign, minutes, wholeSeconds, hundredths)
 end
 
+--- Format distance in meters or kilometers
+-- @param meters number Distance in meters
+-- @return string Formatted distance string
+local function formatDistance(meters)
+  if not meters or meters < 0 then
+    return "0m"
+  end
+  
+  if meters < 1000 then
+    return string.format("%dm", math.floor(meters + 0.5))
+  else
+    return string.format("%.2f km", meters / 1000)
+  end
+end
+
 --- Get race label with alt route and hotlap suffixes
 -- @param raceName string The race name
 -- @param altRoute boolean|nil Whether alt route is active
@@ -876,6 +891,7 @@ M.calculateAverageMultiplier = calculateAverageMultiplier
 -- Utilities
 M.tableContains = tableContains
 M.formatTime = formatTime
+M.formatDistance = formatDistance
 M.getRaceLabel = getRaceLabel
 
 -- Audio

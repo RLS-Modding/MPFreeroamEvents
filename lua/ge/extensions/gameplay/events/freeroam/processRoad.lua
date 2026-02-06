@@ -864,6 +864,133 @@ local function setStationaryTimeout(timeout)
   remainingTime = config.STATIONARY_TIMEOUT
 end
 
+-- ============================================================================
+-- TRACK DISTANCE CALCULATIONS
+-- ============================================================================
+
+--- Calculate track distances including total length and checkpoint distances
+-- @param nodes table Road nodes array
+-- @param cpList table Checkpoints array (from processRoadNodes)
+-- @return table Distance data with totalLength, checkpointDistances, segmentLengths
+local function calculateTrackDistances(nodes, cpList)
+  if not nodes or #nodes < 2 then
+    return {
+      totalLength = 0,
+      checkpointDistances = {},
+      segmentLengths = {},
+      nodeDistances = {}
+    }
+  end
+
+  -- Build cumulative distance for each node
+  local nodeDistances = {0}  -- First node is at distance 0
+  local totalLength = 0
+  
+  for i = 2, #nodes do
+    local segmentDist = calculateDistance(nodes[i-1], nodes[i])
+    totalLength = totalLength + segmentDist
+    nodeDistances[i] = totalLength
+  end
+
+  -- Calculate checkpoint distances
+  local checkpointDistances = {}
+  local segmentLengths = {}
+  local prevCheckpointDist = 0
+
+  if cpList and #cpList > 0 then
+    for i, cp in ipairs(cpList) do
+      local cpIndex = cp.index or 1
+      -- Clamp to valid range
+      cpIndex = math.max(1, math.min(cpIndex, #nodes))
+      local cpDist = nodeDistances[cpIndex] or 0
+      
+      checkpointDistances[i] = cpDist
+      segmentLengths[i] = cpDist - prevCheckpointDist
+      prevCheckpointDist = cpDist
+    end
+  end
+
+  return {
+    totalLength = totalLength,
+    checkpointDistances = checkpointDistances,
+    segmentLengths = segmentLengths,
+    nodeDistances = nodeDistances
+  }
+end
+
+--- Calculate live distance for a player position on the track
+-- @param nodes table Road nodes array
+-- @param playerPos vec3 Player position
+-- @param trackDistances table Result from calculateTrackDistances
+-- @param currentCheckpoint number|nil Current checkpoint index (1-based)
+-- @return table Distance info with completed, remaining, progress, toNextCheckpoint
+local function calculateLiveDistance(nodes, playerPos, trackDistances, currentCheckpoint)
+  if not nodes or #nodes < 2 or not trackDistances or not playerPos then
+    return {
+      completed = 0,
+      remaining = trackDistances and trackDistances.totalLength or 0,
+      progress = 0,
+      toNextCheckpoint = 0
+    }
+  end
+
+  local nodeDistances = trackDistances.nodeDistances
+  local totalLength = trackDistances.totalLength
+  
+  if not nodeDistances or #nodeDistances == 0 then
+    return {
+      completed = 0,
+      remaining = totalLength,
+      progress = 0,
+      toNextCheckpoint = 0
+    }
+  end
+
+  -- Find the nearest road segment
+  local nearestIndex = 1
+  local minDistance = math.huge
+  local nearestT = 0  -- Interpolation parameter along segment
+
+  for i = 1, #nodes - 1 do
+    local dist, t = distanceToLineSegment(playerPos, nodes[i], nodes[i + 1])
+    if dist < minDistance then
+      minDistance = dist
+      nearestIndex = i
+      nearestT = t
+    end
+  end
+
+  -- Calculate completed distance with interpolation
+  local baseDist = nodeDistances[nearestIndex] or 0
+  local nextDist = nodeDistances[nearestIndex + 1] or baseDist
+  local segmentLength = nextDist - baseDist
+  local completed = baseDist + (segmentLength * nearestT)
+  
+  -- Clamp to valid range
+  completed = math.max(0, math.min(completed, totalLength))
+  local remaining = totalLength - completed
+  local progress = totalLength > 0 and (completed / totalLength) or 0
+
+  -- Calculate distance to next checkpoint
+  local toNextCheckpoint = 0
+  if currentCheckpoint and trackDistances.checkpointDistances then
+    local nextCpIndex = currentCheckpoint + 1
+    if trackDistances.checkpointDistances[nextCpIndex] then
+      toNextCheckpoint = math.max(0, trackDistances.checkpointDistances[nextCpIndex] - completed)
+    elseif nextCpIndex > #trackDistances.checkpointDistances then
+      -- Past all checkpoints, distance to finish
+      toNextCheckpoint = remaining
+    end
+  end
+
+  return {
+    completed = completed,
+    remaining = remaining,
+    progress = progress,
+    toNextCheckpoint = toNextCheckpoint
+  }
+end
+
 --- Reset all state
 local function reset()
   roadNodes = nil
@@ -897,5 +1024,14 @@ M.reset = reset
 M.checkPlayerOnRoad = checkPlayerOnRoad
 M.setStationaryTimeout = setStationaryTimeout
 M.onExtensionLoaded = onExtensionLoaded
+
+-- Track distance functions
+M.calculateTrackDistances = calculateTrackDistances
+M.calculateLiveDistance = calculateLiveDistance
+
+-- Accessor for current road nodes
+M.getRoadNodes = function() return roadNodes end
+M.getAltRoadNodes = function() return altRoadNodes end
+M.getCurrentCheckpoints = function() return checkpoints end
 
 return M

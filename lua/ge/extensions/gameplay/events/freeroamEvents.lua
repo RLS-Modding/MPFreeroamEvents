@@ -43,6 +43,10 @@ local maxSpeed = 0
 local races = nil
 local isReplay = false
 
+-- Track distance state
+local trackDistances = nil
+local liveDistanceInfo = nil
+
 local previousGameState = nil
 local saveGameState = false
 
@@ -68,6 +72,8 @@ local function resetRaceState()
   totalCheckpoints = 0
   currentExpectedCheckpoint = 1
   initialVehicleDamage = 0
+  trackDistances = nil
+  liveDistanceInfo = nil
 end
 
 -- ============================================================================
@@ -216,6 +222,11 @@ local function buildCompletionMessage(race, raceLabel, newBest, leaderboardEntry
       message = message .. string.format("%s\nTime: %s\nLap: %d", raceLabel, utils.formatTime(in_race_time), lapCount)
     else
       message = message .. string.format("%s\nTime: %s", raceLabel, utils.formatTime(in_race_time))
+    end
+    
+    -- Add track length if available
+    if trackDistances and trackDistances.totalLength and trackDistances.totalLength > 0 then
+      message = message .. string.format("\nTrack Length: %s", utils.formatDistance(trackDistances.totalLength))
     end
     
     -- Add damage information for damage-based races
@@ -742,6 +753,14 @@ local function handleStart(data, raceName, event)
       checkpointManager.setAltRoute(mAltRoute)
 
       currentExpectedCheckpoint = checkpointManager.enableCheckpoint(0)
+      
+      -- Calculate track distances
+      local roadNodes = processRoad.getRoadNodes()
+      if roadNodes and #roadNodes > 0 then
+        trackDistances = processRoad.calculateTrackDistances(roadNodes, checkpoints)
+      else
+        trackDistances = nil
+      end
     end
   else
     utils.setActiveLight(raceName, "red")
@@ -784,20 +803,30 @@ local function handleCheckpoint(data, raceName, checkpointIndex, isAlt)
       totalCheckpoints = checkpointManager.calculateTotalCheckpoints(race)
     end
 
-    -- Display checkpoint message
+    -- Display checkpoint message with distance info
     local checkpointMessage = ""
     local splitDiff = getDifference(raceName, checkpointsHit)
+    
+    -- Build distance suffix if track distances are available
+    local distanceSuffix = ""
+    if trackDistances and trackDistances.totalLength and trackDistances.totalLength > 0 then
+      local completedDist = trackDistances.checkpointDistances and trackDistances.checkpointDistances[checkpointsHit] or 0
+      distanceSuffix = string.format(" — %s / %s", 
+        utils.formatDistance(completedDist), 
+        utils.formatDistance(trackDistances.totalLength))
+    end
+    
     if splitDiff then
       local raceLabel = getCurrentRaceLabel()
       local leaderboardEntry = leaderboardManager.getLeaderboardEntry(mInventoryId, raceLabel)
       local totalDiff = in_race_time - (leaderboardEntry and leaderboardEntry.splitTimes and leaderboardEntry.splitTimes[checkpointsHit] or 0)
 
-      checkpointMessage = string.format("Checkpoint %d/%d - Time: %s\nSplit: %s | Total: %s",
-        checkpointsHit, totalCheckpoints, utils.formatTime(in_race_time), formatSplitDifference(splitDiff),
+      checkpointMessage = string.format("Checkpoint %d/%d%s\nTime: %s | Split: %s | Total: %s",
+        checkpointsHit, totalCheckpoints, distanceSuffix, utils.formatTime(in_race_time), formatSplitDifference(splitDiff),
         formatSplitDifference(totalDiff))
     else
-      checkpointMessage = string.format("Checkpoint %d/%d - Time: %s", checkpointsHit, totalCheckpoints,
-        utils.formatTime(in_race_time))
+      checkpointMessage = string.format("Checkpoint %d/%d%s\nTime: %s", checkpointsHit, totalCheckpoints,
+        distanceSuffix, utils.formatTime(in_race_time))
     end
     utils.displayMessage(checkpointMessage, 7)
     Assets:displayAssets(data)
@@ -994,6 +1023,18 @@ local function onUpdate(dtReal, dtSim, dtRaw)
   if mActiveRace and races and races[mActiveRace] and races[mActiveRace].checkpointRoad then
     if processRoad.checkPlayerOnRoad() == false then
       exitRace(false)
+    end
+    
+    -- Calculate live distance if track distances are available
+    if timerActive and trackDistances then
+      local playerVehicle = be:getPlayerVehicle(0)
+      if playerVehicle then
+        local playerPos = playerVehicle:getPosition()
+        local roadNodes = processRoad.getRoadNodes()
+        if roadNodes and #roadNodes > 0 then
+          liveDistanceInfo = processRoad.calculateLiveDistance(roadNodes, playerPos, trackDistances, currCheckpoint)
+        end
+      end
     end
   end
   

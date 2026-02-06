@@ -384,9 +384,10 @@ local function showRaceCheckpoints()
   checkpoints, altCheckpoints = processRoad.getCheckpoints(races[currentRaceName])
   checkpointManager.createCheckpoints(checkpoints, altCheckpoints)
 
-  roadNodes = processRoad.getRoadNodesFromRace(races[currentRaceName])
+  -- Get road nodes for visualization and distance calculation
+  roadNodes = processRoad.getRoadNodes() or processRoad.getRoadNodesFromRace(races[currentRaceName])
   if races[currentRaceName].altRoute then
-    altRoadNodes = processRoad.getRoadNodesFromRace(races[currentRaceName].altRoute)
+    altRoadNodes = processRoad.getAltRoadNodes() or processRoad.getRoadNodesFromRace(races[currentRaceName].altRoute)
   else
     altRoadNodes = {}
   end
@@ -732,7 +733,7 @@ local function drawRewardCurve(race)
   if not race.bestTime or not race.reward then return end
   
   local numPoints = 50
-  local rewardData = ffi.new("float[?]", numPoints)
+  local rewardData = im.ArrayFloat(numPoints)
   local minTime = race.bestTime * 0.5
   local maxTime = race.bestTime * 2.0
   local timeStep = (maxTime - minTime) / (numPoints - 1)
@@ -769,7 +770,7 @@ local function drawRewardCurve(race)
   local scaleMax = string.format("$%.0f", maxReward)
   
   im.Text("Reward Curve (Time vs Reward)")
-  im.PlotLines1("##RewardCurve", rewardData, numPoints, 0, scaleMax, 0, maxReward * 1.1, im.ImVec2(im.GetContentRegionAvail().x, 100))
+  im.PlotLines1("##RewardCurve", rewardData, numPoints, 0, scaleMax, 0, maxReward * 1.1, im.ImVec2(im.GetContentRegionAvail().x, 150))
   
   -- Time axis labels
   im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
@@ -1659,6 +1660,119 @@ local function onEditorGui()
       -- Checkpoint count display
       if showingRaceCheckpoints and #checkpoints > 0 then
         im.TextColored(colors.info, string.format("Generated %d checkpoints", #checkpoints))
+        
+        -- Track distance display
+        if roadNodes and #roadNodes > 1 then
+          local trackDist = processRoad.calculateTrackDistances(roadNodes, checkpoints)
+          
+          if trackDist and trackDist.totalLength > 0 then
+            im.Spacing()
+            im.SeparatorText("Track Distance Analysis")
+            
+            -- Total track length
+            local totalMeters = trackDist.totalLength
+            im.Text("Total Track Length:")
+            im.SameLine()
+            im.TextColored(colors.success, string.format("%s (%s)", 
+              utils.formatDistance(totalMeters),
+              string.format("%.2f km", totalMeters / 1000)))
+            
+            -- Gap analysis
+            if trackDist.segmentLengths and #trackDist.segmentLengths > 0 then
+              local minGap = math.huge
+              local maxGap = 0
+              local totalGap = 0
+              local gapCount = 0
+              
+              for i, gap in ipairs(trackDist.segmentLengths) do
+                if gap > 0 then
+                  if gap < minGap then minGap = gap end
+                  if gap > maxGap then maxGap = gap end
+                  totalGap = totalGap + gap
+                  gapCount = gapCount + 1
+                end
+              end
+              
+              local avgGap = gapCount > 0 and (totalGap / gapCount) or 0
+              
+              im.Spacing()
+              im.Text("Checkpoint Gap Analysis:")
+              
+              if im.BeginTable("GapAnalysis", 2, im.TableFlags_BordersInnerV) then
+                im.TableNextRow()
+                im.TableSetColumnIndex(0)
+                im.Text("Average Gap")
+                im.TableSetColumnIndex(1)
+                im.Text(utils.formatDistance(avgGap))
+                
+                im.TableNextRow()
+                im.TableSetColumnIndex(0)
+                im.Text("Shortest Gap")
+                im.TableSetColumnIndex(1)
+                im.Text(minGap < math.huge and utils.formatDistance(minGap) or "N/A")
+                
+                im.TableNextRow()
+                im.TableSetColumnIndex(0)
+                im.Text("Longest Gap")
+                im.TableSetColumnIndex(1)
+                im.Text(utils.formatDistance(maxGap))
+                
+                im.EndTable()
+              end
+              
+              -- Warning for uneven spacing
+              local hasUnevenSpacing = false
+              local unevenCheckpoints = {}
+              
+              if avgGap > 0 then
+                for i, gap in ipairs(trackDist.segmentLengths) do
+                  if gap > avgGap * 2 or gap < avgGap * 0.5 then
+                    hasUnevenSpacing = true
+                    table.insert(unevenCheckpoints, i)
+                  end
+                end
+              end
+              
+              if hasUnevenSpacing then
+                im.Spacing()
+                im.TextColored(colors.warning, "⚠ Uneven checkpoint spacing detected!")
+                im.TextColored(colors.dimmed, string.format("Checkpoints with unusual gaps: %s", table.concat(unevenCheckpoints, ", ")))
+              end
+              
+              -- Per-checkpoint distances (collapsible)
+              im.Spacing()
+              if im.CollapsingHeader1("Per-Checkpoint Distances") then
+                if im.BeginTable("CheckpointDistances", 3, im.TableFlags_Borders + im.TableFlags_RowBg) then
+                  im.TableSetupColumn("CP#", im.TableColumnFlags_WidthFixed, 40)
+                  im.TableSetupColumn("Cumulative", im.TableColumnFlags_WidthStretch)
+                  im.TableSetupColumn("Segment", im.TableColumnFlags_WidthStretch)
+                  im.TableHeadersRow()
+                  
+                  for i, cpDist in ipairs(trackDist.checkpointDistances) do
+                    local segDist = trackDist.segmentLengths[i] or 0
+                    local isUneven = avgGap > 0 and (segDist > avgGap * 2 or segDist < avgGap * 0.5)
+                    
+                    im.TableNextRow()
+                    im.TableSetColumnIndex(0)
+                    im.Text(tostring(i))
+                    
+                    im.TableSetColumnIndex(1)
+                    im.Text(utils.formatDistance(cpDist))
+                    
+                    im.TableSetColumnIndex(2)
+                    if isUneven then
+                      im.TextColored(colors.warning, utils.formatDistance(segDist) .. " ⚠")
+                    else
+                      im.Text(utils.formatDistance(segDist))
+                    end
+                  end
+                  
+                  im.EndTable()
+                end
+              end
+            end
+          end
+        end
       elseif showingRaceCheckpoints and #checkpoints == 0 then
         im.TextColored(colors.warning, "⚠ No checkpoints generated - check road selection")
       end
