@@ -733,7 +733,7 @@ local function drawRewardCurve(race)
   if not race.bestTime or not race.reward then return end
   
   local numPoints = 50
-  local rewardData = im.ArrayFloat(numPoints)
+  local rewardTable = {}
   local minTime = race.bestTime * 0.5
   local maxTime = race.bestTime * 2.0
   local timeStep = (maxTime - minTime) / (numPoints - 1)
@@ -756,7 +756,7 @@ local function drawRewardCurve(race)
       reward = utils.raceReward(race.bestTime, race.reward, time, race.type)
     end
     
-    rewardData[i] = reward
+    rewardTable[i + 1] = reward
     if reward > maxReward then maxReward = reward end
     
     -- Find closest point to preview time
@@ -770,7 +770,8 @@ local function drawRewardCurve(race)
   local scaleMax = string.format("$%.0f", maxReward)
   
   im.Text("Reward Curve (Time vs Reward)")
-  im.PlotLines1("##RewardCurve", rewardData, numPoints, 0, scaleMax, 0, maxReward * 1.1, im.ImVec2(im.GetContentRegionAvail().x, 150))
+  local rewardData = im.TableToArrayFloat(rewardTable)
+  im.PlotLines1("##RewardCurve", rewardData, im.GetLengthArrayFloat(rewardData), 0, scaleMax, 0, maxReward * 1.1, im.ImVec2(im.GetContentRegionAvail().x, 150))
   
   -- Time axis labels
   im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
