@@ -853,16 +853,36 @@ local function formatMoney(amount)
   end
 end
 
---- Draw a PlotLines graph with readable Y-axis labels instead of scientific notation
+--- Determine a nice scale divisor and suffix for large values
+local function getScaleInfo(maxVal)
+  if maxVal >= 1000000 then
+    return 1000000, "M"
+  elseif maxVal >= 1000 then
+    return 1000, "k"
+  else
+    return 1, ""
+  end
+end
+
+--- Draw a PlotLines graph with readable tooltip values (no scientific notation)
 local function drawPlot(label, dataTable, overlayMax, graphHeight)
-  local data = im.TableToArrayFloat(dataTable)
+  -- Scale data down so ImGui's built-in tooltip shows readable numbers
+  local divisor, suffix = getScaleInfo(overlayMax)
+  local scaledTable = {}
+  for i, v in ipairs(dataTable) do
+    scaledTable[i] = v / divisor
+  end
+  
+  local data = im.TableToArrayFloat(scaledTable)
   local dataLen = im.GetLengthArrayFloat(data)
-  local scaleMax = math.max(overlayMax * 1.1, 1)
+  local scaledMax = math.max((overlayMax / divisor) * 1.1, 0.01)
   
-  -- Draw the plot with no overlay text (we'll add our own labels)
-  im.PlotLines1(label, data, dataLen, 0, "", 0, scaleMax, im.ImVec2(im.GetContentRegionAvail().x, graphHeight))
+  -- Overlay text shows the unit so tooltip values make sense
+  local overlayText = suffix ~= "" and string.format("$%s (hover for values)", suffix) or "$ (hover for values)"
   
-  -- Draw Y-axis labels above the graph
+  im.PlotLines1(label, data, dataLen, 0, overlayText, 0, scaledMax, im.ImVec2(im.GetContentRegionAvail().x, graphHeight))
+  
+  -- Y-axis labels
   local cursorY = im.GetCursorPosY()
   im.SetCursorPosY(cursorY - graphHeight - 2)
   im.TextColored(colors.dimmed, formatMoney(overlayMax))
