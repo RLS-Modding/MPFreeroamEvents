@@ -708,11 +708,11 @@ local function onEditorGui()
         im.Checkbox("Hardcore", hardcore)
 
         if bestTimeSession[0] then
-          reward = reward * 1.2
+          reward = reward * utils.NEW_BEST_BONUS
         end
 
         if inRange[0] then
-          reward = reward * 1.05
+          reward = reward * utils.IN_RANGE_BONUS
         end
 
         if hardcore[0] then
