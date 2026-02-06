@@ -619,18 +619,21 @@ local function teleportToStart(raceName)
     -- Place vehicle behind staging (offset back along the approach direction)
     local stagingScale = stagingTrigger:getScale()
     local offset = math.max(stagingScale.x, stagingScale.y) + 8 -- behind staging zone + some room
-    local spawnPos = stagingPos - dir * offset + vec3(0, 0, 1)
+    local spawnPos = stagingPos - dir * offset
     
-    -- Build rotation quaternion facing toward start (along dir)
-    -- BeamNG uses Y-forward convention for vehicles
+    -- Snap to ground using surface height
+    spawnPos.z = be:getSurfaceHeightBelow(spawnPos + vec3(0, 0, 10)) + 0.5
+    
+    -- quatFromDir uses -Y as forward in BeamNG, so negate dir to face toward start
     local up = vec3(0, 0, 1)
-    local rot = quatFromDir(dir, up)
+    local rot = quatFromDir(-dir, up)
     
     playerVeh:setPositionRotation(spawnPos.x, spawnPos.y, spawnPos.z, rot.x, rot.y, rot.z, rot.w)
     editor.showNotification("Teleported behind staging, facing start")
   else
-    -- Only one trigger exists, teleport near it with its rotation
-    local pos = targetTrigger:getPosition() + vec3(0, 0, 1)
+    -- Only one trigger exists, teleport near it
+    local pos = targetTrigger:getPosition()
+    pos.z = be:getSurfaceHeightBelow(pos + vec3(0, 0, 10)) + 0.5
     local rot = targetTrigger:getRotation()
     playerVeh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
     editor.showNotification("Teleported to " .. (stagingTrigger and "staging" or "start") .. " trigger")
