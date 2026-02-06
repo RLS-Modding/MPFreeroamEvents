@@ -1,16 +1,20 @@
 -- World Editor Freeroam Event Creator
-
--- TODO:
--- Alt Route Handling
+-- Improved version with alt routes, validation, reward graphs, and UI polish
 
 local M = {}
-local logTag = 'editor_freeroamEventEditor' -- this is used for logging as a tag
-local im = ui_imgui -- shortcut for imgui
+local logTag = 'editor_freeroamEventEditor'
+local im = ui_imgui
+local ffi = require("ffi")
 local toolWindowName = "editor_freeroamEventEditor_window"
 
 local processRoad = require('gameplay/events/freeroam/processRoad')
 local checkpointManager = require('gameplay/events/freeroam/checkpointManager')
 local utils = require('gameplay/events/freeroam/utils')
+
+-- ============================================================================
+-- STATE VARIABLES
+-- ============================================================================
+
 local races = {}
 local currentRaceName = nil
 local modified = false
@@ -28,20 +32,41 @@ local altCheckpoints = {}
 local roadNodes = {}
 local altRoadNodes = {}
 
+-- Reward calculator state
 local bestTimeSession = im.BoolPtr(false)
 local inRange = im.BoolPtr(false)
-local realTime = im.FloatPtr(0)
+local realTime = im.FloatPtr(60)
 local driftScore = im.IntPtr(1000)
 local lapCount = im.IntPtr(1)
 local hardcore = im.BoolPtr(false)
 local damagePercentage = im.FloatPtr(0.0)
+local topSpeedPreview = im.FloatPtr(100)
 
 local lookingForRoad = false
-
--- Outside any function, at the top-level scope with other state variables
 local roadFilterText = ""
+local eventFilterText = ""
 
--- Template for new race
+-- Validation state
+local showValidationModal = false
+local validationIssues = {}
+
+-- ============================================================================
+-- UI COLORS
+-- ============================================================================
+
+local colors = {
+  success = im.ImVec4(0.2, 0.8, 0.2, 1.0),
+  warning = im.ImVec4(1.0, 0.8, 0.2, 1.0),
+  error = im.ImVec4(0.9, 0.2, 0.2, 1.0),
+  info = im.ImVec4(0.4, 0.7, 1.0, 1.0),
+  dimmed = im.ImVec4(0.6, 0.6, 0.6, 1.0),
+  highlight = im.ImVec4(0.95, 0.43, 0.49, 1.0),
+}
+
+-- ============================================================================
+-- TEMPLATE
+-- ============================================================================
+
 local raceTemplate = {
   bestTime = 60,
   reward = 1000,
@@ -51,10 +76,71 @@ local raceTemplate = {
   timeout = 10
 }
 
--- Function to create a new race
+-- ============================================================================
+-- UTILITY FUNCTIONS
+-- ============================================================================
+
+local function tableContains(tbl, val)
+  if not tbl then return false end
+  for _, v in ipairs(tbl) do
+    if v == val then return true end
+  end
+  return false
+end
+
+local function tableIndexOf(tbl, value)
+  for i, v in ipairs(tbl) do
+    if v == value then return i end
+  end
+  return nil
+end
+
+local function countTableEntries(t)
+  local count = 0
+  if t then
+    for _ in pairs(t) do count = count + 1 end
+  end
+  return count
+end
+
+-- Deep copy a table (handles nested tables)
+local function deepCopyTable(orig)
+  local copy
+  if type(orig) == 'table' then
+    copy = {}
+    for orig_key, orig_value in next, orig, nil do
+      copy[deepCopyTable(orig_key)] = deepCopyTable(orig_value)
+    end
+    setmetatable(copy, deepCopyTable(getmetatable(orig)))
+  else
+    copy = orig
+  end
+  return copy
+end
+
+-- ============================================================================
+-- HELP POPUP HELPER
+-- ============================================================================
+
+local function helpMarker(text, sameLine)
+  if sameLine then im.SameLine() end
+  im.TextDisabled("(?)")
+  if im.IsItemHovered() then
+    im.BeginTooltip()
+    im.PushTextWrapPos(im.GetFontSize() * 25)
+    im.TextUnformatted(text)
+    im.PopTextWrapPos()
+    im.EndTooltip()
+  end
+end
+
+-- ============================================================================
+-- RACE DATA MANAGEMENT
+-- ============================================================================
+
 local function createNewRace()
   local newRaceName = "event_" .. os.time()
-  races[newRaceName] = deepcopy(raceTemplate)
+  races[newRaceName] = deepCopyTable(raceTemplate)
   races[newRaceName].label = "New Event"
   currentRaceName = newRaceName
   modified = true
@@ -62,7 +148,17 @@ local function createNewRace()
   return newRaceName
 end
 
--- Function to load race data from file
+local function duplicateRace(raceName)
+  if not raceName or not races[raceName] then return nil end
+  local newRaceName = raceName .. "_copy_" .. os.time()
+  races[newRaceName] = deepCopyTable(races[raceName])
+  races[newRaceName].label = (races[raceName].label or "Event") .. " (Copy)"
+  currentRaceName = newRaceName
+  modified = true
+  log('I', logTag, "Duplicated event: " .. raceName .. " -> " .. newRaceName)
+  return newRaceName
+end
+
 local function loadRaceData()
   local level = getCurrentLevelIdentifier()
   if not level then return end
@@ -73,7 +169,7 @@ local function loadRaceData()
   modified = false
 
   for raceName, race in pairs(races) do
-    for _, rType in ipairs(race.type) do
+    for _, rType in ipairs(race.type or {}) do
       if not tableContains(raceTypes, rType) then
         table.insert(raceTypes, rType)
       end
@@ -83,7 +179,6 @@ local function loadRaceData()
   log('I', logTag, "Loaded race data for level: " .. level)
 end
 
--- Function to save race data to file
 local function saveRaceData()
   local level = getCurrentLevelIdentifier()
   if not level then 
@@ -98,7 +193,6 @@ local function saveRaceData()
   log('I', logTag, "Saved race data to: " .. filePath)
 end
 
--- Function to create new empty race data
 local function createNewRaceData()
   races = {}
   currentRaceName = nil
@@ -106,18 +200,186 @@ local function createNewRaceData()
   log('I', logTag, "Created new race data")
 end
 
--- Count the number of entries in a table
-local function countTableEntries(t)
-  local count = 0
-  if t then
-    for _ in pairs(t) do count = count + 1 end
-  end
-  return count
+-- ============================================================================
+-- VALIDATION
+-- ============================================================================
+
+local function validateRoad(roadName)
+  if not roadName or roadName == "" then return false end
+  return tableContains(levelDecalRoads, roadName)
 end
+
+local function validateCheckpointRoads(race)
+  if not race.checkpointRoad then return false, "No checkpoint road set" end
+  
+  if type(race.checkpointRoad) == "string" then
+    if not validateRoad(race.checkpointRoad) then
+      return false, "Road '" .. race.checkpointRoad .. "' does not exist"
+    end
+  elseif type(race.checkpointRoad) == "table" then
+    if #race.checkpointRoad == 0 then
+      return false, "No checkpoint roads set"
+    end
+    for _, roadName in ipairs(race.checkpointRoad) do
+      if roadName ~= "" and not validateRoad(roadName) then
+        return false, "Road '" .. roadName .. "' does not exist"
+      end
+    end
+  end
+  
+  return true, nil
+end
+
+local function triggerExists(prefix, raceName)
+  return scenetree.findObject(prefix .. raceName) ~= nil
+end
+
+local function isRaceComplete(raceName, race)
+  local hasCheckpointRoad = race.checkpointRoad ~= nil
+  if type(race.checkpointRoad) == "table" then
+    hasCheckpointRoad = #race.checkpointRoad > 0 and race.checkpointRoad[1] ~= ""
+  elseif type(race.checkpointRoad) == "string" then
+    hasCheckpointRoad = race.checkpointRoad ~= ""
+  end
+  
+  local hasStartTrigger = triggerExists("fre_start_", raceName)
+  local hasStagingTrigger = triggerExists("fre_staging_", raceName)
+  
+  local hasPitTrigger = true
+  if race.hasPits then
+    hasPitTrigger = triggerExists("fre_pits_", raceName)
+  end
+  
+  if not race.hotlap then
+    local hasFinishTrigger = triggerExists("fre_finish_", raceName)
+    return hasCheckpointRoad and hasStartTrigger and hasStagingTrigger and hasFinishTrigger and hasPitTrigger
+  else
+    return hasCheckpointRoad and hasStartTrigger and hasStagingTrigger and hasPitTrigger
+  end
+end
+
+local function getMissingComponents(raceName, race)
+  local missing = {}
+  
+  if not race.checkpointRoad or race.checkpointRoad == "" then
+    table.insert(missing, "Checkpoint road")
+  elseif type(race.checkpointRoad) == "table" and #race.checkpointRoad == 0 then
+    table.insert(missing, "Checkpoint road")
+  end
+  
+  if not triggerExists("fre_start_", raceName) then
+    table.insert(missing, "Start trigger")
+  end
+  
+  if not triggerExists("fre_staging_", raceName) then
+    table.insert(missing, "Staging trigger")
+  end
+  
+  if not race.hotlap then
+    if not triggerExists("fre_finish_", raceName) then
+      table.insert(missing, "Finish trigger")
+    end
+  end
+  
+  if race.hasPits and not triggerExists("fre_pits_", raceName) then
+    table.insert(missing, "Pit trigger")
+  end
+  
+  return missing
+end
+
+local function getEventCompleteness(raceName, race)
+  local components = {
+    {name = "Checkpoint Road", done = race.checkpointRoad ~= nil and race.checkpointRoad ~= ""},
+    {name = "Start Trigger", done = triggerExists("fre_start_", raceName)},
+    {name = "Staging Trigger", done = triggerExists("fre_staging_", raceName)},
+    {name = "Event Type", done = race.type and #race.type > 0},
+    {name = "Best Time", done = race.bestTime and race.bestTime > 0},
+    {name = "Reward", done = race.reward and race.reward > 0},
+  }
+  
+  if not race.hotlap then
+    table.insert(components, 3, {name = "Finish Trigger", done = triggerExists("fre_finish_", raceName)})
+  end
+  
+  if race.hasPits then
+    table.insert(components, {name = "Pit Trigger", done = triggerExists("fre_pits_", raceName)})
+  end
+  
+  local done = 0
+  for _, c in ipairs(components) do
+    if c.done then done = done + 1 end
+  end
+  
+  return done, #components, components
+end
+
+local function validateAllEvents()
+  local issues = {}
+  
+  for raceName, race in pairs(races) do
+    local eventIssues = {}
+    
+    -- Check types
+    if not race.type or #race.type == 0 then
+      table.insert(eventIssues, "No event types selected")
+    end
+    
+    -- Check checkpoint road
+    local roadValid, roadError = validateCheckpointRoads(race)
+    if not roadValid then
+      table.insert(eventIssues, roadError)
+    end
+    
+    -- Check triggers
+    if not triggerExists("fre_start_", raceName) then
+      table.insert(eventIssues, "Missing start trigger")
+    end
+    if not triggerExists("fre_staging_", raceName) then
+      table.insert(eventIssues, "Missing staging trigger")
+    end
+    if not race.hotlap and not triggerExists("fre_finish_", raceName) then
+      table.insert(eventIssues, "Missing finish trigger")
+    end
+    if race.hasPits and not triggerExists("fre_pits_", raceName) then
+      table.insert(eventIssues, "Missing pit trigger")
+    end
+    
+    -- Check reward sanity
+    if race.reward and race.bestTime then
+      local testReward = utils.raceReward(race.bestTime, race.reward, race.bestTime, race.type)
+      if testReward <= 0 then
+        table.insert(eventIssues, "Reward calculation returns 0 or negative for target time")
+      end
+    end
+    
+    -- Check best time
+    if not race.bestTime or race.bestTime <= 0 then
+      table.insert(eventIssues, "Invalid best time")
+    end
+    
+    -- Check reward
+    if not race.reward or race.reward <= 0 then
+      table.insert(eventIssues, "Invalid reward amount")
+    end
+    
+    if #eventIssues > 0 then
+      issues[raceName] = {
+        label = race.label or raceName,
+        issues = eventIssues
+      }
+    end
+  end
+  
+  return issues
+end
+
+-- ============================================================================
+-- CHECKPOINT AND ROAD VISUALIZATION
+-- ============================================================================
 
 local function showRaceCheckpoints()
   if not currentRaceName then return end
-  dump(races[currentRaceName])
 
   checkpoints, altCheckpoints = processRoad.getCheckpoints(races[currentRaceName])
   checkpointManager.createCheckpoints(checkpoints, altCheckpoints)
@@ -125,25 +387,57 @@ local function showRaceCheckpoints()
   roadNodes = processRoad.getRoadNodesFromRace(races[currentRaceName])
   if races[currentRaceName].altRoute then
     altRoadNodes = processRoad.getRoadNodesFromRace(races[currentRaceName].altRoute)
+  else
+    altRoadNodes = {}
   end
 end
 
 local function removeRaceCheckpoints()
   checkpointManager.removeCheckpoints()
   processRoad.reset()
+  roadNodes = {}
+  altRoadNodes = {}
 end
 
--- Function to find all triggers and decal roads in the level
+local function drawRoadPath()
+  if not showingRaceCheckpoints then return end
+  
+  local lineWidth = editor.getPreference("gizmos.general.lineThicknessScale") * 2 or 2
+  
+  -- Draw main route in green
+  if roadNodes and #roadNodes > 1 then
+    for i = 1, #roadNodes - 1 do
+      local p1 = roadNodes[i]
+      local p2 = roadNodes[i + 1]
+      if p1 and p2 and p1.pos and p2.pos then
+        debugDrawer:drawLineInstance(p1.pos, p2.pos, lineWidth, ColorF(0.2, 0.9, 0.2, 0.8))
+      end
+    end
+  end
+  
+  -- Draw alt route in blue
+  if altRoadNodes and #altRoadNodes > 1 then
+    for i = 1, #altRoadNodes - 1 do
+      local p1 = altRoadNodes[i]
+      local p2 = altRoadNodes[i + 1]
+      if p1 and p2 and p1.pos and p2.pos then
+        debugDrawer:drawLineInstance(p1.pos, p2.pos, lineWidth, ColorF(0.2, 0.5, 0.9, 0.8))
+      end
+    end
+  end
+end
+
+-- ============================================================================
+-- LEVEL OBJECTS
+-- ============================================================================
+
 local function findLevelObjects()
-  -- Find all triggers and decal roads
   levelTriggers = {}
   levelDecalRoads = {}
   
-  -- The correct way to iterate through objects in BeamNG
   local missionGroup = scenetree.findObject("MissionGroup")
   if not missionGroup then return end
   
-  -- Recursive function to search for objects
   local function searchObjects(group)
     for i, objName in ipairs(group:getObjects()) do
       local obj = scenetree.findObject(objName)
@@ -153,7 +447,6 @@ local function findLevelObjects()
         elseif obj:getClassName() == "DecalRoad" then
           table.insert(levelDecalRoads, obj:getName())
         end
-        -- If this is a group, search inside it
         if obj:getClassName() == "SimGroup" then
           searchObjects(obj)
         end
@@ -176,7 +469,6 @@ local function findDecalRoads()
         if obj:getClassName() == "DecalRoad" then
           table.insert(levelDecalRoads, obj:getName())
         end
-        -- If this is a group, search inside it
         if obj:getClassName() == "SimGroup" then
           searchObjects(obj)
         end
@@ -187,65 +479,37 @@ local function findDecalRoads()
   searchObjects(missionGroup)
 end
 
--- Function to create a trigger with a specific name (used as callback)
-local function createTriggerWithName(instance)
-  if instance and pendingTriggerName then
-    instance:setName(pendingTriggerName)
-    log('I', logTag, "Created trigger with name: " .. pendingTriggerName)
-    
-    -- Add to levelTriggers list if it exists
-    if levelTriggers then
-      table.insert(levelTriggers, pendingTriggerName)
-    end
-    
-    -- Clear pending name
-    pendingTriggerName = nil
-  end
-end
+-- ============================================================================
+-- TRIGGER MANAGEMENT
+-- ============================================================================
 
--- Our custom object placement system
 local function triggerPlacementUpdate()
   if not pendingTriggerType or not pendingTriggerRace then return end
   
-  -- Get ray from camera to mouse position
-  local res = getCameraMouseRay()
-  
-  -- Cast ray against scene
   local hit = cameraMouseRayCast(true)
-
   local pos = vec3(worldEditorCppApi.snapPositionToGrid(hit.pos))
   local lineWidth = editor.getPreference("gizmos.general.lineThicknessScale") * 4
+  
   debugDrawer:drawLineInstance((pos - vec3(2, 0, 0)), (pos + vec3(2, 0, 0)), lineWidth, ColorF(1, 0, 0, 1))
   debugDrawer:drawLineInstance((pos - vec3(0, 2, 0)), (pos + vec3(0, 2, 0)), lineWidth, ColorF(0, 1, 0, 1))
   debugDrawer:drawLineInstance((pos - vec3(0, 0, 2)), (pos + vec3(0, 0, 2)), lineWidth, ColorF(0, 0, 1, 1))
   
-  -- Create object on mouse click
   if im.IsMouseClicked(0) and editor.isViewportHovered() then
-    -- Create the trigger name based on type and race
     local prefix
-    if pendingTriggerType == "start" then
-      prefix = "fre_start_"
-    elseif pendingTriggerType == "staging" then
-      prefix = "fre_staging_"
-    elseif pendingTriggerType == "finish" then
-      prefix = "fre_finish_"
-    elseif pendingTriggerType == "pit" then
-      prefix = "fre_pits_"
+    if pendingTriggerType == "start" then prefix = "fre_start_"
+    elseif pendingTriggerType == "staging" then prefix = "fre_staging_"
+    elseif pendingTriggerType == "finish" then prefix = "fre_finish_"
+    elseif pendingTriggerType == "pit" then prefix = "fre_pits_"
     end
     
     local triggerName = prefix .. pendingTriggerRace
     
-    -- Create the trigger object
     local obj = worldEditorCppApi.createObject("BeamNGTrigger")
     if obj then
-      -- Set name and register
       obj:setName(triggerName)
       obj:registerObject("")
-      
-      -- Position at hit location
       obj:setPosition(pos)
       
-      -- Get appropriate parent
       local parent = scenetree.MissionGroup
       local selection = editor.selection
       if selection and selection.object and #selection.object > 0 then
@@ -260,23 +524,18 @@ local function triggerPlacementUpdate()
         end
       end
       
-      -- Add to parent
       if parent then
         parent:addObject(obj)
       end
       
-      -- Select the new trigger
       editor.selectObjectById(obj:getID())
       
-      -- Add to level triggers list
       if levelTriggers then
         table.insert(levelTriggers, triggerName)
       end
       
-      -- Log creation
       log('I', logTag, "Created new trigger: " .. triggerName)
       
-      -- Clear pending state
       pendingTriggerType = nil
       pendingTriggerRace = nil
       showTriggerPlacementHelp = false
@@ -284,33 +543,23 @@ local function triggerPlacementUpdate()
   end
 end
 
--- Function to initiate trigger creation
 local function createOrSelectTrigger(triggerType, raceName)
   if not raceName then return end
   
-  -- Trigger prefix based on type
   local prefix
-  if triggerType == "start" then
-    prefix = "fre_start_"
-  elseif triggerType == "staging" then
-    prefix = "fre_staging_"
-  elseif triggerType == "finish" then
-    prefix = "fre_finish_"
-  elseif triggerType == "pit" then
-    prefix = "fre_pits_"
+  if triggerType == "start" then prefix = "fre_start_"
+  elseif triggerType == "staging" then prefix = "fre_staging_"
+  elseif triggerType == "finish" then prefix = "fre_finish_"
+  elseif triggerType == "pit" then prefix = "fre_pits_"
   end
   
   local triggerName = prefix .. raceName
-  
-  -- Check if the trigger already exists
   local existingTrigger = scenetree.findObject(triggerName)
   
   if existingTrigger then
-    -- Select the existing trigger
     editor.selectObjectById(existingTrigger:getID())
     log('I', logTag, "Selected trigger: " .. triggerName)
   else
-    -- Set pending state for custom placement
     pendingTriggerType = triggerType
     pendingTriggerRace = raceName
     showTriggerPlacementHelp = true
@@ -319,84 +568,52 @@ local function createOrSelectTrigger(triggerType, raceName)
   end
 end
 
--- Helper function to get the currently selected parent object
-local function getCurrentSelectedParent()
-  if editor.selection and editor.selection.object and #editor.selection.object > 0 then
-    local obj = scenetree.findObjectById(editor.selection.object[1])
-    if obj and (obj:getClassName() == "SimGroup" or obj:isSubClassOf("SimGroup")) then
-      return obj
-    end
-    if obj then
-      local group = obj:getGroup()
-      if group and group:getName() ~= "MissionCleanup" then
-        return group
-      end
-    end
-  end
-  -- Default to MissionGroup
-  return scenetree.MissionGroup
+local function getTriggerInfo(triggerName)
+  local trigger = scenetree.findObject(triggerName)
+  if not trigger then return nil end
+  
+  local pos = trigger:getPosition()
+  local scale = trigger:getScale()
+  
+  return {
+    position = pos,
+    scale = scale,
+    obj = trigger
+  }
 end
 
-local function tableIndexOf(table, value)
-  for i, v in ipairs(table) do
-    if v == value then
-      return i
-    end
+-- ============================================================================
+-- EVENT TESTING
+-- ============================================================================
+
+local function teleportToStart(raceName)
+  if not raceName then return end
+  
+  local startTrigger = scenetree.findObject("fre_start_" .. raceName)
+  if not startTrigger then
+    editor.showNotification("No start trigger found for this event")
+    return
   end
+  
+  local playerVeh = be:getPlayerVehicle(0)
+  if not playerVeh then
+    editor.showNotification("No player vehicle found")
+    return
+  end
+  
+  local pos = startTrigger:getPosition()
+  local rot = startTrigger:getRotation()
+  
+  -- Offset slightly above ground
+  pos = pos + vec3(0, 0, 1)
+  
+  playerVeh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
+  editor.showNotification("Teleported to start trigger")
 end
 
--- Function to check if a race is complete
-local function isRaceComplete(raceName, race)
-  -- Check for required components
-  local hasCheckpointRoad = race.checkpointRoad ~= nil and race.checkpointRoad ~= ""
-  
-  -- Check for triggers
-  local hasStartTrigger = scenetree.findObject("fre_start_" .. raceName) ~= nil
-  local hasStagingTrigger = scenetree.findObject("fre_staging_" .. raceName) ~= nil
-  
-  -- Pit trigger is only required if pits are enabled
-  local hasPitTrigger = true
-  if race.hasPits then
-    hasPitTrigger = scenetree.findObject("fre_pits_" .. raceName) ~= nil
-  end
-  
-  -- Point-to-point specific requirements
-  if not race.hotlap then
-    local hasFinishTrigger = scenetree.findObject("fre_finish_" .. raceName) ~= nil
-    return hasCheckpointRoad and hasStartTrigger and hasStagingTrigger and hasFinishTrigger and hasPitTrigger
-  else
-    return hasCheckpointRoad and hasStartTrigger and hasStagingTrigger and hasPitTrigger
-  end
-end
-
--- Helper function to get missing components list
-local function getMissingComponents(raceName, race)
-  local missing = {}
-  
-  if not race.checkpointRoad or race.checkpointRoad == "" then
-    table.insert(missing, "Checkpoint road")
-  end
-  
-  if not scenetree.findObject("fre_start_" .. raceName) then
-    table.insert(missing, "Start trigger")
-  end
-  
-  if not scenetree.findObject("fre_staging_" .. raceName) then
-    table.insert(missing, "Staging trigger")
-  end
-  
-  if not race.hotlap then
-    if not scenetree.findObject("fre_finish_" .. raceName) then
-      table.insert(missing, "Finish trigger")
-    end
-  end
-  
-  if race.hasPits and not scenetree.findObject("fre_pits_" .. raceName) then
-    table.insert(missing, "Pit trigger")
-  end
-  
-  return missing
-end
+-- ============================================================================
+-- CHECKPOINTS EDITOR
+-- ============================================================================
 
 local function showCheckpointsEditor(race)
   if not showingCheckpointsEditor then return end
@@ -407,26 +624,25 @@ local function showCheckpointsEditor(race)
     end
   end
 
-  im.Text("Editing Checkpoints")
-  if im.CollapsingHeader1("Checkpoints") then
+  im.TextColored(colors.info, "Manual Checkpoint Editing")
+  if im.CollapsingHeader1("Checkpoints##manual") then
     for i, checkpoint in ipairs(checkpoints) do
-      -- Use a unique ID for each checkpoint row
       im.PushID1("checkpoint_" .. tostring(i))
       
       im.Text("Checkpoint " .. tostring(i))
       im.SameLine()
 
-      if im.Button("X##remove"..i, im.ImVec2(24, 0)) then
+      if im.Button("X##remove", im.ImVec2(24, 0)) then
         table.remove(race.checkpointIndexs, i)
         removeRaceCheckpoints()
         showRaceCheckpoints()
+        im.PopID()
         break
       end
       im.SameLine()
       
-      -- Set the width of the input field to half the available width
-      im.SetNextItemWidth(im.GetContentRegionAvailWidth() / 2)
-      local index = im.IntPtr(race.checkpointIndexs[i])
+      im.SetNextItemWidth(im.GetContentRegionAvail().x * 0.5)
+      local index = im.IntPtr(race.checkpointIndexs[i] or 0)
       if im.InputInt("##Index", index, 1, 10) then
         race.checkpointIndexs[i] = index[0]
         removeRaceCheckpoints()
@@ -434,10 +650,11 @@ local function showCheckpointsEditor(race)
       end
       im.SameLine()
 
-      if im.Button("Add##add"..i, im.ImVec2(60, 0)) then
-        table.insert(race.checkpointIndexs, i + 1, race.checkpointIndexs[i] + 1)
+      if im.Button("Add##add", im.ImVec2(60, 0)) then
+        table.insert(race.checkpointIndexs, i + 1, (race.checkpointIndexs[i] or 0) + 1)
         removeRaceCheckpoints()
         showRaceCheckpoints()
+        im.PopID()
         break
       end
       
@@ -446,7 +663,380 @@ local function showCheckpointsEditor(race)
   end
 end
 
--- Main editor GUI function
+-- ============================================================================
+-- ROAD SELECTOR UI COMPONENT
+-- ============================================================================
+
+local function drawRoadSelector(label, roads, index, filterText, onChanged)
+  local currentRoad = roads[index] or "Choose a road"
+  local comboLabel = label .. "##" .. tostring(index)
+  
+  -- Validate road exists
+  local roadValid = currentRoad == "Choose a road" or validateRoad(currentRoad)
+  
+  if not roadValid then
+    im.PushStyleColor2(im.Col_FrameBg, im.ImVec4(0.5, 0.1, 0.1, 1))
+  end
+  
+  if im.BeginCombo(comboLabel, currentRoad) then
+    lookingForRoad = true
+    local filterLower = filterText:lower()
+    local foundAny = false
+    
+    if currentRoad ~= "Choose a road" then
+      if filterLower == "" or string.find(currentRoad:lower(), filterLower) then
+        if im.Selectable1(currentRoad .. " (current)", true) then end
+        im.Separator()
+        foundAny = true
+      end
+    end
+    
+    for _, availableRoad in ipairs(levelDecalRoads) do
+      if availableRoad == "" then goto continue end
+      if filterLower ~= "" and not string.find(availableRoad:lower(), filterLower) then
+        goto continue
+      end
+      
+      foundAny = true
+      if im.Selectable1(availableRoad, availableRoad == currentRoad) then
+        roads[index] = availableRoad
+        if onChanged then onChanged() end
+      end
+      ::continue::
+    end
+    
+    if not foundAny then
+      im.TextColored(colors.dimmed, "No roads match your filter")
+    end
+    
+    im.EndCombo()
+  else
+    lookingForRoad = false
+  end
+  
+  if not roadValid then
+    im.PopStyleColor()
+    im.SameLine()
+    im.TextColored(colors.error, "!")
+    if im.IsItemHovered() then
+      im.SetTooltip("Road does not exist in this level")
+    end
+  end
+end
+
+-- ============================================================================
+-- REWARD CURVE VISUALIZATION
+-- ============================================================================
+
+local function drawRewardCurve(race)
+  if not race.bestTime or not race.reward then return end
+  
+  local numPoints = 50
+  local rewardData = ffi.new("float[?]", numPoints)
+  local minTime = race.bestTime * 0.5
+  local maxTime = race.bestTime * 2.0
+  local timeStep = (maxTime - minTime) / (numPoints - 1)
+  
+  local maxReward = 0
+  local previewTimeIndex = -1
+  local previewReward = 0
+  
+  for i = 0, numPoints - 1 do
+    local time = minTime + (i * timeStep)
+    local reward
+    
+    if race.driftGoal then
+      reward = utils.driftReward(race, time, driftScore[0])
+    elseif race.topSpeed then
+      reward = utils.topSpeedReward(race.topSpeedGoal or 100, race.reward, topSpeedPreview[0], race.type)
+    elseif race.damageFactor and race.damageFactor > 0 then
+      reward = utils.hybridRaceReward(race.bestTime, race.reward, time, race.damageFactor, damagePercentage[0], race.type)
+    else
+      reward = utils.raceReward(race.bestTime, race.reward, time, race.type)
+    end
+    
+    rewardData[i] = reward
+    if reward > maxReward then maxReward = reward end
+    
+    -- Find closest point to preview time
+    if math.abs(time - realTime[0]) < timeStep then
+      previewTimeIndex = i
+      previewReward = reward
+    end
+  end
+  
+  -- Scale label
+  local scaleMax = string.format("$%.0f", maxReward)
+  
+  im.Text("Reward Curve (Time vs Reward)")
+  im.PlotLines1("##RewardCurve", rewardData, numPoints, 0, scaleMax, 0, maxReward * 1.1, im.ImVec2(im.GetContentRegionAvail().x, 100))
+  
+  -- Time axis labels
+  im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
+  im.SameLine()
+  im.SetCursorPosX(im.GetContentRegionAvail().x * 0.45)
+  im.TextColored(colors.dimmed, string.format("%.1fs (target)", race.bestTime))
+  im.SameLine()
+  im.SetCursorPosX(im.GetContentRegionAvail().x * 0.9)
+  im.TextColored(colors.dimmed, string.format("%.1fs", maxTime))
+  
+  -- Show preview marker info
+  if previewTimeIndex >= 0 then
+    im.TextColored(colors.info, string.format("Preview: %.1fs = $%.0f", realTime[0], previewReward))
+  end
+end
+
+-- ============================================================================
+-- ALT ROUTE EDITOR
+-- ============================================================================
+
+local altRoadFilterText = ""
+
+local function drawAltRouteEditor(race, changed)
+  im.SeparatorText("Alternative Route")
+  
+  local hasAltRoute = im.BoolPtr(race.altRoute ~= nil)
+  if im.Checkbox("Enable Alternative Route", hasAltRoute) then
+    if hasAltRoute[0] then
+      race.altRoute = {
+        checkpointRoad = {},
+        bestTime = race.bestTime,
+        reward = race.reward,
+        mergeCheckpoints = {}
+      }
+    else
+      race.altRoute = nil
+    end
+    return true
+  end
+  
+  if not race.altRoute then return changed end
+  
+  local alt = race.altRoute
+  
+  -- Alt Route Label
+  local altLabel = im.ArrayChar(128, alt.label or "")
+  if im.InputText("Alt Route Label", altLabel) then
+    alt.label = ffi.string(altLabel)
+    changed = true
+  end
+  
+  -- Alt Best Time
+  local altBestTime = im.FloatPtr(alt.bestTime or race.bestTime)
+  if im.InputFloat("Alt Best Time (seconds)", altBestTime, 1, 5, "%.1f") then
+    alt.bestTime = altBestTime[0]
+    changed = true
+  end
+  
+  -- Alt Reward
+  local altReward = im.IntPtr(alt.reward or race.reward)
+  if im.InputInt("Alt Reward ($)", altReward, 100, 1000) then
+    alt.reward = altReward[0]
+    changed = true
+  end
+  
+  -- Alt Hotlap Time
+  local hasAltHotlap = im.BoolPtr(alt.hotlap ~= nil)
+  if im.Checkbox("Alt Route Hotlap", hasAltHotlap) then
+    if hasAltHotlap[0] then
+      alt.hotlap = alt.bestTime * 0.9
+    else
+      alt.hotlap = nil
+    end
+    changed = true
+  end
+  
+  if alt.hotlap then
+    local altHotlap = im.FloatPtr(alt.hotlap)
+    if im.InputFloat("Alt Hotlap Time (seconds)", altHotlap, 1, 5, "%.1f") then
+      alt.hotlap = altHotlap[0]
+      changed = true
+    end
+  end
+  
+  -- Alt Damage Factor
+  local hasAltDamageFactor = im.BoolPtr(alt.damageFactor ~= nil)
+  if im.Checkbox("Alt Damage Factor", hasAltDamageFactor) then
+    if hasAltDamageFactor[0] then
+      alt.damageFactor = 0.5
+    else
+      alt.damageFactor = nil
+    end
+    changed = true
+  end
+  
+  if alt.damageFactor then
+    local altDamageFactor = im.FloatPtr(alt.damageFactor)
+    if im.SliderFloat("Alt Damage Factor", altDamageFactor, 0.0, 1.0, "%.2f") then
+      alt.damageFactor = altDamageFactor[0]
+      changed = true
+    end
+  end
+  
+  -- Alt Checkpoint Roads
+  im.Separator()
+  im.Text("Alt Route Checkpoint Roads:")
+  
+  -- Road filter
+  local altRoadFilter = im.ArrayChar(128, altRoadFilterText)
+  if im.InputText("Filter Alt Roads", altRoadFilter, 128) then
+    altRoadFilterText = ffi.string(altRoadFilter)
+  end
+  
+  -- Initialize checkpoint roads
+  if not alt.checkpointRoad then
+    alt.checkpointRoad = {}
+  elseif type(alt.checkpointRoad) == "string" then
+    alt.checkpointRoad = {alt.checkpointRoad}
+  end
+  
+  -- Display alt road selections
+  for i, roadName in ipairs(alt.checkpointRoad) do
+    im.PushID1("alt_road_" .. tostring(i))
+    
+    if i > 1 then
+      if im.Button("X##remove", im.ImVec2(24, 0)) then
+        table.remove(alt.checkpointRoad, i)
+        changed = true
+        im.PopID()
+        break
+      end
+      im.SameLine()
+    end
+    
+    drawRoadSelector("Select Alt Road #" .. i, alt.checkpointRoad, i, altRoadFilterText, function()
+      changed = true
+    end)
+    
+    im.PopID()
+  end
+  
+  if im.Button("+ Add Alt Road", im.ImVec2(im.GetContentRegionAvail().x, 0)) then
+    table.insert(alt.checkpointRoad, "")
+    changed = true
+  end
+  
+  -- Merge Checkpoints
+  im.Separator()
+  im.Text("Merge Checkpoints (main route indices where alt merges):")
+  helpMarker("Indices of main route checkpoints where the alt route reconnects", true)
+  
+  if not alt.mergeCheckpoints then
+    alt.mergeCheckpoints = {}
+  end
+  
+  for i, cpIndex in ipairs(alt.mergeCheckpoints) do
+    im.PushID1("merge_cp_" .. tostring(i))
+    
+    if im.Button("X##remove", im.ImVec2(24, 0)) then
+      table.remove(alt.mergeCheckpoints, i)
+      changed = true
+      im.PopID()
+      break
+    end
+    im.SameLine()
+    
+    im.SetNextItemWidth(100)
+    local idx = im.IntPtr(cpIndex)
+    if im.InputInt("##idx", idx, 1, 1) then
+      alt.mergeCheckpoints[i] = idx[0]
+      changed = true
+    end
+    
+    im.PopID()
+  end
+  
+  if im.Button("+ Add Merge Point", im.ImVec2(im.GetContentRegionAvail().x, 0)) then
+    table.insert(alt.mergeCheckpoints, 1)
+    changed = true
+  end
+  
+  return changed
+end
+
+-- ============================================================================
+-- VALIDATION MODAL
+-- ============================================================================
+
+local function drawValidationModal()
+  if not showValidationModal then return end
+  
+  im.SetNextWindowSize(im.ImVec2(500, 400), im.Cond_FirstUseEver)
+  
+  if im.BeginPopupModal("Validation Issues", nil, im.WindowFlags_AlwaysAutoResize) then
+    if countTableEntries(validationIssues) == 0 then
+      im.TextColored(colors.success, "All events passed validation!")
+      im.Spacing()
+      if im.Button("Close & Save", im.ImVec2(im.GetContentRegionAvail().x, 30)) then
+        saveRaceData()
+        showValidationModal = false
+        im.CloseCurrentPopup()
+      end
+    else
+      im.TextColored(colors.warning, "Some events have issues:")
+      im.Separator()
+      
+      im.BeginChild1("ValidationList", im.ImVec2(0, 300), true)
+      
+      for raceName, eventData in pairs(validationIssues) do
+        if im.CollapsingHeader1(eventData.label .. " (" .. #eventData.issues .. " issues)##" .. raceName) then
+          for _, issue in ipairs(eventData.issues) do
+            im.BulletText(issue)
+          end
+          
+          if im.SmallButton("Go to Event##" .. raceName) then
+            currentRaceName = raceName
+          end
+        end
+      end
+      
+      im.EndChild()
+      
+      im.Separator()
+      
+      if im.Button("Save Anyway", im.ImVec2(im.GetContentRegionAvail().x * 0.48, 30)) then
+        saveRaceData()
+        showValidationModal = false
+        im.CloseCurrentPopup()
+      end
+      im.SameLine()
+      if im.Button("Cancel", im.ImVec2(im.GetContentRegionAvail().x, 30)) then
+        showValidationModal = false
+        im.CloseCurrentPopup()
+      end
+    end
+    
+    im.EndPopup()
+  end
+end
+
+-- ============================================================================
+-- TRIGGER INFO DISPLAY
+-- ============================================================================
+
+local function drawTriggerInfo(triggerType, raceName)
+  local prefix
+  if triggerType == "start" then prefix = "fre_start_"
+  elseif triggerType == "staging" then prefix = "fre_staging_"
+  elseif triggerType == "finish" then prefix = "fre_finish_"
+  elseif triggerType == "pit" then prefix = "fre_pits_"
+  end
+  
+  local info = getTriggerInfo(prefix .. raceName)
+  if info then
+    im.Indent()
+    im.TextColored(colors.dimmed, string.format("Pos: %.1f, %.1f, %.1f", 
+      info.position.x, info.position.y, info.position.z))
+    im.TextColored(colors.dimmed, string.format("Scale: %.1f x %.1f x %.1f", 
+      info.scale.x, info.scale.y, info.scale.z))
+    im.Unindent()
+  end
+end
+
+-- ============================================================================
+-- MAIN EDITOR GUI
+-- ============================================================================
+
 local function onEditorGui()
   if not editor.isWindowVisible(toolWindowName) then return end
   M.onEditorUpdate()
@@ -454,7 +1044,7 @@ local function onEditorGui()
   if editor.beginWindow(toolWindowName, "Freeroam Event Editor", im.WindowFlags_MenuBar) then
     local level = getCurrentLevelIdentifier()
     if not level then
-      im.Text("No level loaded!")
+      im.TextColored(colors.error, "No level loaded!")
       editor.endWindow()
       return
     end
@@ -465,680 +1055,748 @@ local function onEditorGui()
         if im.MenuItem1("New") then
           createNewRaceData()
         end
-        if im.MenuItem1("Load...") then
+        if im.MenuItem1("Load") then
           loadRaceData()
         end
         if im.MenuItem1("Save") then
+          validationIssues = validateAllEvents()
+          showValidationModal = true
+          im.OpenPopup("Validation Issues")
+        end
+        if im.MenuItem1("Save (Skip Validation)") then
           saveRaceData()
+        end
+        im.EndMenu()
+      end
+      if im.BeginMenu("View") then
+        if im.MenuItem1("Refresh Roads") then
+          findDecalRoads()
+        end
+        if im.MenuItem1("Refresh All Objects") then
+          findLevelObjects()
         end
         im.EndMenu()
       end
       im.EndMenuBar()
     end
 
+    -- Validation Modal
+    drawValidationModal()
+
+    -- Status line
     if modified then
-        im.TextColored(im.ImVec4(1, 1, 0, 1), "Modified (unsaved)")
+      im.TextColored(colors.warning, "* Modified (unsaved)")
+    else
+      im.TextColored(colors.success, "Saved")
     end
+    im.SameLine()
+    im.TextColored(colors.dimmed, "| Level: " .. level)
     
-    im.Text("Current Level: " .. level)
+    im.Separator()
     
-    -- Split the window into two columns
-    local windowWidth = im.GetContentRegionAvailWidth()
+    -- Split layout
+    local windowWidth = im.GetContentRegionAvail().x
     local leftPanelWidth = windowWidth * 0.3
     
-    -- Left panel - Event List
+    -- ========== LEFT PANEL - Event List ==========
     im.BeginChild1("EventsList", im.ImVec2(leftPanelWidth, im.GetContentRegionAvail().y), true)
     
-    -- Create new race button
-    if im.Button("Create New Event", im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
+    -- Create & Duplicate buttons
+    if im.Button("+ New Event", im.ImVec2(im.GetContentRegionAvail().x * 0.48, 0)) then
       createNewRace()
+    end
+    im.SameLine()
+    local canDuplicate = currentRaceName ~= nil
+    if not canDuplicate then im.BeginDisabled(true) end
+    if im.Button("Duplicate", im.ImVec2(im.GetContentRegionAvail().x, 0)) then
+      duplicateRace(currentRaceName)
+    end
+    if not canDuplicate then im.EndDisabled() end
+    
+    im.Spacing()
+    
+    -- Event filter
+    local eventFilter = im.ArrayChar(128, eventFilterText)
+    im.SetNextItemWidth(im.GetContentRegionAvail().x)
+    if im.InputTextWithHint("##EventFilter", "Filter events...", eventFilter, 128) then
+      eventFilterText = ffi.string(eventFilter)
     end
     
     im.Separator()
     
-    -- Display races count
+    -- Event count
     local raceCount = countTableEntries(races)
-    im.Text("Events (" .. raceCount .. "):")
+    im.TextColored(colors.dimmed, "Events (" .. raceCount .. "):")
     
-    -- Display each race with a simpler UI
+    -- Event list
+    local filterLower = eventFilterText:lower()
     for raceName, race in pairs(races) do
-      local complete = isRaceComplete(raceName, race)    
+      -- Apply filter
+      local labelLower = (race.label or raceName):lower()
+      if filterLower ~= "" and not string.find(labelLower, filterLower) and not string.find(raceName:lower(), filterLower) then
+        goto continue
+      end
       
+      local complete = isRaceComplete(raceName, race)
+      local isSelected = raceName == currentRaceName
+      
+      -- Color based on completeness
       if not complete then
-        im.PushStyleColor2(im.Col_Button, im.ImVec4(0.8, 0.2, 0.2, 1.0))
-        im.PushStyleColor2(im.Col_ButtonHovered, im.ImVec4(0.9, 0.3, 0.3, 1.0))
-        im.PushStyleColor2(im.Col_ButtonActive, im.ImVec4(1.0, 0.4, 0.4, 1.0))
+        im.PushStyleColor2(im.Col_Button, im.ImVec4(0.5, 0.2, 0.2, 1.0))
+        im.PushStyleColor2(im.Col_ButtonHovered, im.ImVec4(0.6, 0.3, 0.3, 1.0))
+        im.PushStyleColor2(im.Col_ButtonActive, im.ImVec4(0.7, 0.4, 0.4, 1.0))
+      elseif isSelected then
+        im.PushStyleColor2(im.Col_Button, im.ImVec4(0.2, 0.4, 0.6, 1.0))
+        im.PushStyleColor2(im.Col_ButtonHovered, im.ImVec4(0.3, 0.5, 0.7, 1.0))
+        im.PushStyleColor2(im.Col_ButtonActive, im.ImVec4(0.4, 0.6, 0.8, 1.0))
       end
 
-      if im.Button(race.label or "Unnamed" .. "##" .. raceName, im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
+      if im.Button((race.label or "Unnamed") .. "##" .. raceName, im.ImVec2(im.GetContentRegionAvail().x, 0)) then
         currentRaceName = raceName
         if showingRaceCheckpoints then
-            removeRaceCheckpoints()
+          removeRaceCheckpoints()
+          showRaceCheckpoints()
         end
       end
       
       if not complete then
         im.PopStyleColor(3)
+      elseif isSelected then
+        im.PopStyleColor(3)
       end
       
-      -- Show tooltip with missing components
+      -- Tooltip
       if im.IsItemHovered() then
         im.BeginTooltip()
-        im.Text("Event ID: " .. raceName)
+        im.Text("ID: " .. raceName)
         
-        if not complete then
-          im.TextColored(im.ImVec4(1, 0.4, 0.4, 1), "Incomplete race! Missing:")
-          local missing = getMissingComponents(raceName, race)
-          for _, component in ipairs(missing) do
-            im.BulletText(component)
-          end
+        local done, total, components = getEventCompleteness(raceName, race)
+        local progressText = string.format("Progress: %d/%d", done, total)
+        
+        if done == total then
+          im.TextColored(colors.success, progressText .. " - Complete!")
         else
-          im.TextColored(im.ImVec4(0.4, 1, 0.4, 1), "Complete race")
+          im.TextColored(colors.warning, progressText)
+          im.Separator()
+          for _, c in ipairs(components) do
+            if c.done then
+              im.TextColored(colors.success, "✓ " .. c.name)
+            else
+              im.TextColored(colors.error, "✗ " .. c.name)
+            end
+          end
         end
         im.EndTooltip()
       end
+      
+      ::continue::
     end
     
     im.EndChild()
     
     im.SameLine()
     
+    -- ========== RIGHT PANEL - Event Details ==========
     im.BeginChild1("RaceDetails", im.ImVec2(0, im.GetContentRegionAvail().y), true)
     
-    -- Edit the currently selected race
     if currentRaceName and races[currentRaceName] then
       local race = races[currentRaceName]
-      im.Text("Editing Event: " .. currentRaceName)
-
-      im.Separator()
       local changed = false
       
-      -- SECTION: Basic Event Information
-      if im.CollapsingHeader1("Basic Event Information") then
-        -- Edit Event ID directly
-        im.PushID1(currentRaceName .. "_id")
-        local raceNameBuf = im.ArrayChar(128, currentRaceName)
-        if im.InputText("Event ID", raceNameBuf, 128, im.InputTextFlags_EnterReturnsTrue) then
-          local newRaceName = ffi.string(raceNameBuf)
-          if newRaceName ~= currentRaceName and newRaceName ~= "" and not races[newRaceName] then
-            -- First, check for and rename any associated triggers
-            local prefixes = {"fre_start_", "fre_staging_", "fre_finish_"}
-            
-            for _, prefix in ipairs(prefixes) do
-              local oldTriggerName = prefix .. currentRaceName
-              local newTriggerName = prefix .. newRaceName
-              
-              -- Find the trigger with old name
-              local trigger = scenetree.findObject(oldTriggerName)
-              if trigger then
-                -- Rename the trigger
-                trigger:setName(newTriggerName)
-                
-                -- Update levelTriggers list if we have it
-                if levelTriggers then
-                  for i, name in ipairs(levelTriggers) do
-                    if name == oldTriggerName then
-                      levelTriggers[i] = newTriggerName
-                      break
-                    end
-                  end
-                end
-                
-                log('I', logTag, "Renamed trigger from " .. oldTriggerName .. " to " .. newTriggerName)
-              end
+      -- Header with progress
+      local done, total, _ = getEventCompleteness(currentRaceName, race)
+      im.Text("Editing: ")
+      im.SameLine()
+      im.TextColored(colors.info, race.label or currentRaceName)
+      im.SameLine()
+      local progressColor = done == total and colors.success or colors.warning
+      im.TextColored(progressColor, string.format("(%d/%d)", done, total))
+      
+      -- Progress bar
+      im.ProgressBar(done / total, im.ImVec2(-1, 0), string.format("%d/%d components", done, total))
+      
+      im.Spacing()
+      
+      -- ===== BASIC INFO =====
+      im.SeparatorText("Basic Information")
+      
+      -- Event ID
+      im.PushID1(currentRaceName .. "_id")
+      local raceNameBuf = im.ArrayChar(128, currentRaceName)
+      if im.InputText("Event ID", raceNameBuf, 128, im.InputTextFlags_EnterReturnsTrue) then
+        local newRaceName = ffi.string(raceNameBuf)
+        if newRaceName ~= currentRaceName and newRaceName ~= "" and not races[newRaceName] then
+          -- Rename triggers
+          local prefixes = {"fre_start_", "fre_staging_", "fre_finish_", "fre_pits_"}
+          for _, prefix in ipairs(prefixes) do
+            local trigger = scenetree.findObject(prefix .. currentRaceName)
+            if trigger then
+              trigger:setName(prefix .. newRaceName)
             end
-            
-            -- Now proceed with race renaming
-            -- Create copy of race data with new name
-            races[newRaceName] = deepcopy(race)
-            -- Remove old race data
-            races[currentRaceName] = nil
-            -- Update current race name
-            currentRaceName = newRaceName
-            changed = true
-            
-            -- Log the changes
-            log('I', logTag, "Renamed race from " .. currentRaceName .. " to " .. newRaceName)
           end
-        end
-        im.PopID()
-        
-        -- Edit Event Label
-        local eventLabel = im.ArrayChar(128, race.label or "")
-        if im.InputText("Event Label", eventLabel) then
-          race.label = ffi.string(eventLabel)
+          
+          races[newRaceName] = deepCopyTable(race)
+          races[currentRaceName] = nil
+          currentRaceName = newRaceName
           changed = true
         end
-        
-        -- Best Time
-        local bestTime = im.FloatPtr(race.bestTime or 60)
-        if im.InputFloat("Best Time (seconds)", bestTime, 1, 5, "%.1f") then
-          race.bestTime = bestTime[0]
-          changed = true
-        end
-
-        local isDriftGoal = im.BoolPtr(race.driftGoal ~= nil)
-        if im.Checkbox("Drift Event", isDriftGoal) then
-          if isDriftGoal[0] then
-            race.driftGoal = 1.0
-          else
-            race.driftGoal = nil
-          end
-          changed = true
-        end
-        
+      end
+      im.PopID()
+      
+      -- Event Label
+      local eventLabel = im.ArrayChar(128, race.label or "")
+      if im.InputText("Event Label", eventLabel) then
+        race.label = ffi.string(eventLabel)
+        changed = true
+      end
+      
+      -- Best Time
+      local bestTime = im.FloatPtr(race.bestTime or 60)
+      if im.InputFloat("Best Time (seconds)", bestTime, 1, 5, "%.1f") then
+        race.bestTime = bestTime[0]
+        changed = true
+      end
+      
+      -- ===== EVENT TYPE =====
+      im.SeparatorText("Event Type")
+      
+      -- Drift Event
+      local isDriftGoal = im.BoolPtr(race.driftGoal ~= nil)
+      if im.Checkbox("Drift Event", isDriftGoal) then
         if isDriftGoal[0] then
-          local driftGoal = im.IntPtr(race.driftGoal or 1000)
-          if im.InputInt("Drift Goal", driftGoal, 100, 10000) then
-            race.driftGoal = driftGoal[0]
-            changed = true
-          end
-        end
-        
-        -- Damage Factor
-        local hasDamageFactor = im.BoolPtr(race.damageFactor ~= nil)
-        if im.Checkbox("Enable Damage Factor", hasDamageFactor) then
-          if hasDamageFactor[0] then
-            race.damageFactor = 0.5
-          else
-            race.damageFactor = nil
-          end
-          changed = true
-        end
-        
-        if hasDamageFactor[0] then
-          local damageFactor = im.FloatPtr(race.damageFactor or 0.5)
-          if im.SliderFloat("Damage Factor", damageFactor, 0.0, 1.0, "%.2f") then
-            race.damageFactor = damageFactor[0]
-            changed = true
-          end
-          im.SameLine()
-          if im.Button("?##damageFactor") then
-            im.OpenPopup("Damage Factor Help")
-          end
-          if im.BeginPopupModal("Damage Factor Help", nil, im.WindowFlags_AlwaysAutoResize) then
-            im.Text("Damage Factor determines how damage affects scoring:")
-            im.Separator()
-            im.BulletText("0.0 = Time only (traditional time trial)")
-            im.BulletText("0.5 = 50% time, 50% damage (balanced)")
-            im.BulletText("1.0 = Damage only (no damage = full reward)")
-            im.Separator()
-            im.Text("Higher values prioritize avoiding damage over speed.")
-            if im.Button("Close") then
-              im.CloseCurrentPopup()
-            end
-            im.EndPopup()
-          end
-        end
-      end
-
-      if im.CollapsingHeader1("Reward") then
-        -- Reward
-        local reward = im.IntPtr(race.reward or 1000)
-        if im.InputInt("Reward ($)", reward, 100, 1000) then
-          race.reward = reward[0]
-          changed = true
-        end
-
-        im.Text("Reward Calculation:")
-
-        im.InputFloat("Time (seconds)", realTime, 1, 5, "%.1f")
-
-        local reward
-        if race.driftGoal then
-          im.InputInt("Drift Score", driftScore, 100, 10000)
-          reward = utils.driftReward(race, realTime[0], driftScore[0])
-        elseif race.damageFactor and race.damageFactor > 0 then
-          im.SliderFloat("Damage % (Preview)", damagePercentage, 0.0, 1.0, "%.1f")
-          im.SameLine()
-          im.Text(string.format("(%.1f%%)", damagePercentage[0] * 100))
-          reward = utils.hybridRaceReward(race.bestTime, race.reward, realTime[0], race.damageFactor, damagePercentage[0])
-          im.Text(string.format("Damage Factor: %.2f | Time Factor: %.2f", 
-            race.damageFactor, 1.0 - race.damageFactor))
+          race.driftGoal = 1000
         else
-          reward = utils.raceReward(race.bestTime, race.reward, realTime[0])
+          race.driftGoal = nil
+          race.driftTargetTime = nil
         end
-
-        im.InputInt("Lap Count", lapCount, 1, 100)
-
-        reward = reward * utils.hotlapMultiplier(lapCount[0])
+        changed = true
+      end
+      
+      if isDriftGoal[0] then
+        im.Indent()
+        local driftGoal = im.IntPtr(race.driftGoal or 1000)
+        if im.InputInt("Drift Goal Score", driftGoal, 100, 10000) then
+          race.driftGoal = driftGoal[0]
+          changed = true
+        end
         
-        im.Checkbox("Best Time Session", bestTimeSession)
-        im.Checkbox("In Range", inRange)
-        im.Checkbox("Hardcore", hardcore)
-
-        if bestTimeSession[0] then
-          reward = reward * utils.NEW_BEST_BONUS
+        -- Drift Target Time
+        local hasDriftTargetTime = im.BoolPtr(race.driftTargetTime ~= nil)
+        if im.Checkbox("Custom Drift Target Time", hasDriftTargetTime) then
+          if hasDriftTargetTime[0] then
+            race.driftTargetTime = race.bestTime
+          else
+            race.driftTargetTime = nil
+          end
+          changed = true
         end
-
-        if inRange[0] then
-          reward = reward * utils.IN_RANGE_BONUS
-        end
-
-        if hardcore[0] then
-          reward = reward * 0.5
-        end
-
-        im.Text(string.format("Calculated Reward: %.0f", reward))
         
+        if race.driftTargetTime then
+          local driftTargetTime = im.FloatPtr(race.driftTargetTime)
+          if im.InputFloat("Drift Target Time", driftTargetTime, 1, 5, "%.1f") then
+            race.driftTargetTime = driftTargetTime[0]
+            changed = true
+          end
+        end
+        im.Unindent()
+      end
+      
+      -- Top Speed Event
+      local isTopSpeed = im.BoolPtr(race.topSpeed == true)
+      if im.Checkbox("Top Speed Event", isTopSpeed) then
+        race.topSpeed = isTopSpeed[0] or nil
+        if isTopSpeed[0] and not race.topSpeedGoal then
+          race.topSpeedGoal = 100
+        end
+        changed = true
+      end
+      
+      if race.topSpeed then
+        im.Indent()
+        local topSpeedGoal = im.FloatPtr(race.topSpeedGoal or 100)
+        if im.InputFloat("Top Speed Goal (mph)", topSpeedGoal, 5, 10, "%.1f") then
+          race.topSpeedGoal = topSpeedGoal[0]
+          changed = true
+        end
+        im.Unindent()
+      end
+      
+      -- Damage Factor
+      local hasDamageFactor = im.BoolPtr(race.damageFactor ~= nil)
+      if im.Checkbox("Enable Damage Factor", hasDamageFactor) then
+        if hasDamageFactor[0] then
+          race.damageFactor = 0.5
+        else
+          race.damageFactor = nil
+        end
+        changed = true
+      end
+      
+      if hasDamageFactor[0] then
+        im.Indent()
+        local damageFactor = im.FloatPtr(race.damageFactor or 0.5)
+        if im.SliderFloat("Damage Factor", damageFactor, 0.0, 1.0, "%.2f") then
+          race.damageFactor = damageFactor[0]
+          changed = true
+        end
+        helpMarker("0.0 = Time only (traditional)\n0.5 = 50/50 time/damage\n1.0 = Damage only", true)
+        im.Unindent()
+      end
+      
+      -- Type checkboxes
+      im.Spacing()
+      im.Text("Event Categories:")
+      
+      -- Warn if no types selected
+      if not race.type or #race.type == 0 then
+        im.TextColored(colors.error, "⚠ No event types selected!")
+      end
+      
+      local availableWidth = im.GetContentRegionAvail().x
+      local columnsPerRow = math.max(1, math.floor(availableWidth / 120))
+      local rowCount = 0
+
+      -- Custom type input
+      local customType = im.ArrayChar(128, "")
+      im.SetNextItemWidth(150)
+      if im.InputText("##CustomType", customType, 128, im.InputTextFlags_EnterReturnsTrue) then
+        local newType = ffi.string(customType)
+        if newType ~= "" and not tableContains(raceTypes, newType) then
+          table.insert(raceTypes, newType)
+          if not race.type then race.type = {} end
+          table.insert(race.type, newType)
+          changed = true
+        end
+      end
+      im.SameLine()
+      im.TextColored(colors.dimmed, "(Enter to add custom)")
+
+      for i, rType in ipairs(raceTypes) do
+        if not race.type then race.type = {"motorsport"} end
+        
+        local isSelected = im.BoolPtr(tableContains(race.type, rType))
+        
+        if rowCount % columnsPerRow ~= 0 then
+          im.SameLine()
+        end
+        
+        if im.Checkbox(rType .. "##type", isSelected) then
+          if isSelected[0] then
+            if not tableContains(race.type, rType) then
+              table.insert(race.type, rType)
+            end
+          else
+            local idx = tableIndexOf(race.type, rType)
+            if idx then table.remove(race.type, idx) end
+          end
+          changed = true
+        end
+        
+        rowCount = rowCount + 1
+      end
+      
+      -- ===== REWARD CALCULATOR =====
+      im.SeparatorText("Reward Calculator")
+      
+      -- Reward base value
+      local reward = im.IntPtr(race.reward or 1000)
+      if im.InputInt("Base Reward ($)", reward, 100, 1000) then
+        race.reward = reward[0]
+        changed = true
+      end
+      
+      im.Spacing()
+      
+      -- Calculator inputs in table format
+      if im.BeginTable("RewardCalcInputs", 2, im.TableFlags_BordersInnerV) then
+        im.TableSetupColumn("Input", im.TableColumnFlags_WidthStretch)
+        im.TableSetupColumn("Value", im.TableColumnFlags_WidthStretch)
+        
+        -- Time input
+        im.TableNextRow()
+        im.TableSetColumnIndex(0)
+        im.Text("Preview Time (s)")
+        im.TableSetColumnIndex(1)
+        im.SetNextItemWidth(-1)
+        im.InputFloat("##previewTime", realTime, 1, 5, "%.1f")
+        
+        -- Drift score (if drift event)
+        if race.driftGoal then
+          im.TableNextRow()
+          im.TableSetColumnIndex(0)
+          im.Text("Preview Drift Score")
+          im.TableSetColumnIndex(1)
+          im.SetNextItemWidth(-1)
+          im.InputInt("##previewDrift", driftScore, 100, 1000)
+        end
+        
+        -- Top speed (if top speed event)
+        if race.topSpeed then
+          im.TableNextRow()
+          im.TableSetColumnIndex(0)
+          im.Text("Preview Speed (mph)")
+          im.TableSetColumnIndex(1)
+          im.SetNextItemWidth(-1)
+          im.InputFloat("##previewSpeed", topSpeedPreview, 5, 10, "%.1f")
+        end
+        
+        -- Damage percentage (if damage factor enabled)
         if race.damageFactor and race.damageFactor > 0 then
-          im.Separator()
-          im.TextColored(im.ImVec4(0.7, 0.7, 1.0, 1.0), "Damage-Based Scoring Enabled")
-          im.Text(string.format("- Time Component: %.0f%%", (1.0 - race.damageFactor) * 100))
-          im.Text(string.format("- Damage Component: %.0f%%", race.damageFactor * 100))
-        end
-      end
-      -- SECTION: Event Options
-      if im.CollapsingHeader1("Event Options") then
-        -- Apex Offset
-        local hasApexOffset = im.BoolPtr(race.apexOffset ~= nil)
-        if im.Checkbox("Use Apex Offset", hasApexOffset) then
-          if hasApexOffset[0] then
-            race.apexOffset = 1.0
-          else
-            race.apexOffset = nil
-          end
-          changed = true
+          im.TableNextRow()
+          im.TableSetColumnIndex(0)
+          im.Text("Damage %")
+          im.TableSetColumnIndex(1)
+          im.SetNextItemWidth(-1)
+          im.SliderFloat("##previewDamage", damagePercentage, 0.0, 1.0, "%.0f%%")
         end
         
+        -- Lap count
+        im.TableNextRow()
+        im.TableSetColumnIndex(0)
+        im.Text("Lap Count")
+        im.TableSetColumnIndex(1)
+        im.SetNextItemWidth(-1)
+        im.InputInt("##lapCount", lapCount, 1, 10)
+        
+        im.EndTable()
+      end
+      
+      -- Bonus checkboxes
+      im.Spacing()
+      im.Checkbox("New Best Time Bonus (+" .. string.format("%.0f%%", (utils.NEW_BEST_BONUS - 1) * 100) .. ")", bestTimeSession)
+      im.SameLine()
+      im.Checkbox("In Range Bonus (+" .. string.format("%.0f%%", (utils.IN_RANGE_BONUS - 1) * 100) .. ")", inRange)
+      im.Checkbox("Hardcore Mode (-50%)", hardcore)
+      
+      -- Calculate reward using actual utils functions
+      local calculatedReward
+      if race.driftGoal then
+        calculatedReward = utils.driftReward(race, realTime[0], driftScore[0])
+      elseif race.topSpeed then
+        calculatedReward = utils.topSpeedReward(race.topSpeedGoal or 100, race.reward, topSpeedPreview[0], race.type)
+      elseif race.damageFactor and race.damageFactor > 0 then
+        calculatedReward = utils.hybridRaceReward(race.bestTime, race.reward, realTime[0], race.damageFactor, damagePercentage[0], race.type)
+      else
+        calculatedReward = utils.raceReward(race.bestTime, race.reward, realTime[0], race.type)
+      end
+      
+      -- Apply modifiers
+      calculatedReward = calculatedReward * utils.hotlapMultiplier(lapCount[0])
+      
+      if bestTimeSession[0] then
+        calculatedReward = calculatedReward * utils.NEW_BEST_BONUS
+      end
+      if inRange[0] then
+        calculatedReward = calculatedReward * utils.IN_RANGE_BONUS
+      end
+      if hardcore[0] then
+        calculatedReward = calculatedReward * 0.5
+      end
+      
+      -- Display result
+      im.Spacing()
+      im.Separator()
+      
+      local rewardColor = calculatedReward > 0 and colors.success or colors.error
+      im.TextColored(rewardColor, string.format("Calculated Reward: $%.0f", calculatedReward))
+      
+      if calculatedReward <= 0 then
+        im.TextColored(colors.error, "⚠ Warning: Reward is 0 or negative!")
+      end
+      
+      -- Reward curve visualization
+      im.Spacing()
+      drawRewardCurve(race)
+      
+      -- ===== EVENT OPTIONS =====
+      im.SeparatorText("Event Options")
+      
+      -- Apex Offset
+      local hasApexOffset = im.BoolPtr(race.apexOffset ~= nil)
+      if im.Checkbox("Use Apex Offset", hasApexOffset) then
         if hasApexOffset[0] then
-          local apexOffset = im.FloatPtr(race.apexOffset or 1.0)
-          if im.InputFloat("Apex Offset (Nodes)", apexOffset, 0.1, 1.0, "%.1f") then
-            race.apexOffset = apexOffset[0]
-            changed = true
-          end
+          race.apexOffset = 1.0
+        else
+          race.apexOffset = nil
         end
-        
-        -- Running Start
-        local runningStart = im.BoolPtr(race.runningStart or false) -- Default to true
-        if im.Checkbox("Running Start", runningStart) then
-          race.runningStart = runningStart[0]
+        changed = true
+      end
+      helpMarker("Apex Offset shifts checkpoint positions along the road by a number of nodes.\nPositive values move checkpoints forward, negative values move them backward.\nUseful for fine-tuning checkpoint placement on curves.", true)
+      
+      if hasApexOffset[0] then
+        im.Indent()
+        local apexOffset = im.FloatPtr(race.apexOffset or 1.0)
+        if im.InputFloat("Apex Offset (Nodes)", apexOffset, 0.5, 1.0, "%.1f") then
+          race.apexOffset = apexOffset[0]
           changed = true
         end
+        im.Unindent()
+      end
+      
+      -- Running Start
+      local runningStart = im.BoolPtr(race.runningStart or false)
+      if im.Checkbox("Running Start", runningStart) then
+        race.runningStart = runningStart[0]
+        changed = true
+      end
+      helpMarker("When enabled, the timer starts when the player crosses the start line at speed.\nWhen disabled, the player must be stationary in the staging area before starting.", true)
 
-        -- Reverse
-        local reverse = im.BoolPtr(race.reverse or false)
-        if im.Checkbox("Reverse", reverse) then
-          race.reverse = reverse[0]
+      -- Reverse
+      local reverse = im.BoolPtr(race.reverse or false)
+      if im.Checkbox("Reverse Direction", reverse) then
+        race.reverse = reverse[0]
+        changed = true
+      end
+      
+      -- Timeout
+      local timeout = im.IntPtr(race.timeout or 10)
+      if im.InputInt("Stationary Timeout (s)", timeout, 1, 5) then
+        race.timeout = math.max(1, timeout[0])
+        changed = true
+      end
+      helpMarker("How long a player can remain stationary before the race is cancelled.\nLower = faster paced, Higher = more technical events.", true)
+      
+      -- ===== CHECKPOINT SETTINGS =====
+      im.SeparatorText("Checkpoint Settings")
+      
+      -- Loop type
+      local loopSelected = im.IntPtr(race.hotlap and 1 or 2)
+      
+      if im.RadioButton2("Looped (Hotlap)", loopSelected, im.Int(1)) then
+        race.hotlap = race.hotlap or (race.bestTime * 0.9)
+        changed = true
+      end
+      im.SameLine()
+      if im.RadioButton2("Point-to-Point", loopSelected, im.Int(2)) then
+        race.hotlap = nil
+        changed = true
+      end
+
+      if race.hotlap then
+        local hotlap = im.FloatPtr(race.hotlap)
+        if im.InputFloat("Hotlap Target Time (s)", hotlap, 1, 5, "%.1f") then
+          race.hotlap = hotlap[0]
           changed = true
-        end
-        
-        -- Stationary Timeout
-        local timeout = im.IntPtr(race.timeout or 10)
-        if im.InputInt("Stationary Timeout (seconds)", timeout, 1, 5) then
-          race.timeout = math.max(1, timeout[0]) -- Ensure minimum value of 1 second
-          changed = true
-        end
-        im.SameLine()
-        if im.Button("?##timeout") then
-          im.OpenPopup("Timeout Help")
-        end
-        if im.BeginPopupModal("Timeout Help", nil, im.WindowFlags_AlwaysAutoResize) then
-          im.Text("Stationary Timeout determines how long a player can remain")
-          im.Text("stationary before the race is automatically cancelled.")
-          im.Separator()
-          im.BulletText("Lower values (5-10s): Fast-paced events")
-          im.BulletText("Higher values (15-30s): Methodical/technical events")
-          im.BulletText("Default: 10 seconds")
-          im.Separator()
-          im.Text("Players get countdown warnings before timeout.")
-          if im.Button("Close") then
-            im.CloseCurrentPopup()
-          end
-          im.EndPopup()
         end
       end
       
-      -- SECTION: Event Type
-      if im.CollapsingHeader1("Event Type") then
-        local customType = im.ArrayChar(128, "")
-        if im.InputText("Custom Type", customType, 128, im.InputTextFlags_EnterReturnsTrue) then
-          table.insert(raceTypes, ffi.string(customType))
-          table.insert(race.type, ffi.string(customType))
+      -- Min checkpoint distance
+      local hasMinDist = im.BoolPtr(race.minCheckpointDistance ~= nil)
+      if im.Checkbox("Custom Min Checkpoint Distance", hasMinDist) then
+        if hasMinDist[0] then
+          race.minCheckpointDistance = 50
+        else
+          race.minCheckpointDistance = nil
+        end
+        changed = true
+      end
+      
+      if race.minCheckpointDistance then
+        im.Indent()
+        local minDist = im.FloatPtr(race.minCheckpointDistance)
+        if im.InputFloat("Min Distance (m)", minDist, 5, 10, "%.1f") then
+          race.minCheckpointDistance = minDist[0]
           changed = true
         end
+        im.Unindent()
+      end
+      
+      -- Road selection
+      im.Spacing()
+      im.Text("Checkpoint Roads:")
+      
+      local roadFilter = im.ArrayChar(128, roadFilterText)
+      im.SetNextItemWidth(im.GetContentRegionAvail().x)
+      if im.InputTextWithHint("##RoadFilter", "Filter roads...", roadFilter, 128) then
+        roadFilterText = ffi.string(roadFilter)
+      end
 
-        for _, rType in ipairs(race.type) do
-          if not tableContains(raceTypes, rType) then
-            table.insert(raceTypes, rType)
+      -- Initialize checkpoint roads
+      if race.checkpointRoad and type(race.checkpointRoad) ~= "table" then
+        race.checkpointRoad = {race.checkpointRoad}
+      elseif not race.checkpointRoad then
+        race.checkpointRoad = {}
+      end
+      
+      -- Display road selections
+      for i, roadName in ipairs(race.checkpointRoad) do
+        im.PushID1("road_" .. tostring(i))
+        
+        if i > 1 then
+          if im.Button("X##remove", im.ImVec2(24, 0)) then
+            table.remove(race.checkpointRoad, i)
+            changed = true
+            im.PopID()
+            break
+          end
+          im.SameLine()
+        end
+        
+        drawRoadSelector("Road #" .. i, race.checkpointRoad, i, roadFilterText, function()
+          changed = true
+        end)
+        
+        im.PopID()
+      end
+      
+      if im.Button("+ Add Road", im.ImVec2(im.GetContentRegionAvail().x, 0)) then
+        table.insert(race.checkpointRoad, "")
+        changed = true
+      end
+
+      -- Checkpoint preview buttons
+      im.Spacing()
+      if im.Button("Show Checkpoints", im.ImVec2(im.GetContentRegionAvail().x * 0.48, 0)) then
+        showingRaceCheckpoints = true
+        showRaceCheckpoints()
+      end
+      im.SameLine()
+      if im.Button("Hide Checkpoints", im.ImVec2(im.GetContentRegionAvail().x, 0)) then
+        showingRaceCheckpoints = false
+        removeRaceCheckpoints()
+      end
+
+      -- Checkpoint count display
+      if showingRaceCheckpoints and #checkpoints > 0 then
+        im.TextColored(colors.info, string.format("Generated %d checkpoints", #checkpoints))
+      elseif showingRaceCheckpoints and #checkpoints == 0 then
+        im.TextColored(colors.warning, "⚠ No checkpoints generated - check road selection")
+      end
+
+      -- Manual checkpoint editing
+      if showingRaceCheckpoints then
+        local buttonText = not showingCheckpointsEditor and "Manual Edit Checkpoints" or "Use Auto Checkpoints"
+        if im.Button(buttonText, im.ImVec2(im.GetContentRegionAvail().x, 0)) then
+          if not showingCheckpointsEditor then
+            showingCheckpointsEditor = true
+          else
+            race.checkpointIndexs = nil
+            showingCheckpointsEditor = false
           end
         end
-
-        -- Multi-row checkboxes layout for race types
-        local availableWidth = im.GetContentRegionAvail().x
-        local minCheckboxWidth = 150 -- Minimum width in pixels for each checkbox
-        local columnsPerRow = math.max(1, math.floor(availableWidth / minCheckboxWidth))
-        local columnWidth = availableWidth / columnsPerRow
-        local rowCount = 0
-
-        for i, rType in ipairs(raceTypes) do
-          -- Initialize type if it doesn't exist
-          if not race.type then race.type = {"motorsport"} end
-          
-          local isSelected = im.BoolPtr(tableContains(race.type, rType))
-          local typeChanged = false
-          
-          -- Start of a new row
-          if rowCount % columnsPerRow ~= 0 then
-            im.SameLine()
-            im.SetCursorPosX((rowCount % columnsPerRow) * columnWidth)
+        showCheckpointsEditor(race)
+      end
+      
+      -- ===== ALTERNATIVE ROUTE =====
+      changed = drawAltRouteEditor(race, changed) or changed
+      
+      -- ===== TRIGGER MANAGEMENT =====
+      im.SeparatorText("Trigger Management")
+      
+      -- Helper function for trigger buttons
+      local function triggerButton(triggerType, displayName, raceName)
+        local exists = triggerExists("fre_" .. triggerType .. "_", raceName)
+        local buttonText = exists and ("Select " .. displayName) or ("Create " .. displayName)
+        
+        if pendingTriggerType == triggerType and pendingTriggerRace == raceName then
+          buttonText = "Cancel " .. displayName .. " Placement"
+          im.PushStyleColor2(im.Col_Button, im.ImVec4(0.6, 0.4, 0.1, 1))
+        elseif exists then
+          im.PushStyleColor2(im.Col_Button, im.ImVec4(0.1, 0.4, 0.2, 1))
+        else
+          im.PushStyleColor2(im.Col_Button, im.ImVec4(0.4, 0.1, 0.1, 1))
+        end
+        
+        if im.Button(buttonText .. "##" .. triggerType, im.ImVec2(im.GetContentRegionAvail().x, 0)) then
+          if pendingTriggerType == triggerType and pendingTriggerRace == raceName then
+            pendingTriggerType = nil
+            pendingTriggerRace = nil
+            showTriggerPlacementHelp = false
+          else
+            createOrSelectTrigger(triggerType, raceName)
           end
-          
-          if im.Checkbox(rType, isSelected) then
-            if isSelected[0] then
-              if not tableContains(race.type, rType) then
-                table.insert(race.type, rType)
-                typeChanged = true
-              end
-            else
-              if tableContains(race.type, rType) then
-                table.remove(race.type, tableIndexOf(race.type, rType))
-                typeChanged = true
-              end
-            end
-          end
-          
-          rowCount = rowCount + 1
-          
-          if typeChanged then
-            changed = true
-          end
+        end
+        im.PopStyleColor()
+        
+        -- Show trigger info if exists
+        if exists then
+          drawTriggerInfo(triggerType, raceName)
         end
       end
       
-      -- SECTION: Checkpoint Settings
-      if im.CollapsingHeader1("Checkpoint Settings") then
-        im.Text("Checkpoint Road:")
-        local loopSelected = im.IntPtr(race.hotlap and 1 or 2)
+      triggerButton("start", "Start Trigger", currentRaceName)
+      triggerButton("staging", "Staging Trigger", currentRaceName)
+      
+      if not race.hotlap then
+        triggerButton("finish", "Finish Trigger", currentRaceName)
+      end
+      
+      if showTriggerPlacementHelp then
+        im.TextColored(colors.warning, "Click on the map to place the trigger")
+      end
+      
+      -- ===== PITS MANAGEMENT =====
+      im.SeparatorText("Pits Management")
+      
+      local hasPits = im.BoolPtr(race.hasPits or false)
+      if im.Checkbox("Enable Pit Lane", hasPits) then
+        race.hasPits = hasPits[0]
+        changed = true
+      end
+      
+      if race.hasPits then
+        im.Indent()
         
-        if im.RadioButton2("Looped", loopSelected, im.Int(1)) then
-          race.hotlap = race.hotlap or (race.bestTime * 0.9)
+        local pitSpeedLimit = im.IntPtr(race.pitSpeedLimit or 60)
+        if im.InputInt("Pit Speed Limit", pitSpeedLimit, 5, 10) then
+          race.pitSpeedLimit = math.max(5, pitSpeedLimit[0])
           changed = true
         end
         
-        im.SameLine()
+        local unitOptions = {"KPH", "MPH"}
+        local currentUnit = race.pitSpeedUnit or "KPH"
         
-        if im.RadioButton2("Point-to-Point", loopSelected, im.Int(2)) then
-          race.hotlap = nil
-          changed = true
-        end
-
-        if race.looped == true then
-          local hotlap = im.FloatPtr(race.hotlap or (race.bestTime * 0.9))
-          if not race.hotlap then
-              race.hotlap = hotlap[0]
-          end
-          if im.InputFloat("Hotlap Time (seconds)", hotlap, 1, 5, "%.1f") then
-            race.hotlap = hotlap[0]
-            changed = true
-          end
-        end
-        
-        -- Road selection with filter
-        local roadFilter = im.ArrayChar(128, roadFilterText)
-        if im.InputText("Filter Roads", roadFilter, 128) then
-          roadFilterText = ffi.string(roadFilter)
-        end
-        local filterText = roadFilterText:lower()
-
-        -- Initialize checkpoint roads as a table if needed
-        if race.checkpointRoad and type(race.checkpointRoad) ~= "table" then
-          race.checkpointRoad = {race.checkpointRoad}
-        elseif not race.checkpointRoad then
-          race.checkpointRoad = {}
-        end
-        
-        -- Display all road selections
-        for i, roadName in ipairs(race.checkpointRoad) do
-          local comboLabel = "Select Road #" .. i
-          local currentRoad = roadName or "Choose a road"
-          
-          -- Display a remove button for roads after the first one
-          if i > 1 then
-            if im.Button("X##remove"..i, im.ImVec2(24, 0)) then
-              table.remove(race.checkpointRoad, i)
+        if im.BeginCombo("Speed Unit", currentUnit) then
+          for _, unit in ipairs(unitOptions) do
+            if im.Selectable1(unit, unit == currentUnit) then
+              race.pitSpeedUnit = unit
               changed = true
-              break -- Break to avoid iterating over modified table
             end
-            im.SameLine()
           end
-          
-          if im.BeginCombo(comboLabel, currentRoad) then
-            -- Don't check and invalidate the road here - we do that in onEditorUpdate
-            -- if roadName and not tableContains(levelDecalRoads, roadName) then
-            --   -- Road doesn't exist anymore, mark for update
-            --   changed = true
-            -- end
-            
-            lookingForRoad = true
-            local foundAny = false
-            
-            -- First show the current selection if it exists
-            if roadName and roadName ~= "" then
-              if filterText == "" or string.find(roadName:lower(), filterText) then
-                if im.Selectable1(roadName .. " (current)", true) then
-                  -- Keep the current selection
-                end
-                im.Separator()
-                foundAny = true
-              end
-            end
-            
-            -- Then show filtered options
-            for _, availableRoad in ipairs(levelDecalRoads) do
-              if availableRoad == "" then goto continue end
-              
-              -- Apply filter
-              if filterText ~= "" and not string.find(availableRoad:lower(), filterText) then
-                goto continue
-              end
-              
-              foundAny = true
-              if im.Selectable1(availableRoad, availableRoad == roadName) then
-                race.checkpointRoad[i] = availableRoad
-                changed = true
-              end
-              ::continue::
-            end
-            
-            if not foundAny then
-              im.Text("No roads match your filter")
-            end
-            
-            im.EndCombo()
-          else
-            lookingForRoad = false
-          end
+          im.EndCombo()
         end
         
-        -- Add the plus button to add more roads
-        if im.Button("+ Add Road", im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
-          table.insert(race.checkpointRoad, "")
-          changed = true
-        end
-
-        im.Spacing()
-        if im.Button("Show Checkpoints", im.ImVec2(im.GetContentRegionAvailWidth()/2, 0)) then
-          showingRaceCheckpoints = true
-          showRaceCheckpoints()
-        end
-        im.SameLine()
-        if im.Button("Hide Checkpoints", im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
-          showingRaceCheckpoints = false
-          removeRaceCheckpoints()
-          roadNodes = nil
-          altRoadNodes = nil
-        end
-
-        if showingRaceCheckpoints then
-          local buttonText = not showingCheckpointsEditor and "Manual Edit Checkpoints" or "Use Auto Checkpoints"
-          if im.Button(buttonText, im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
-            if not showingCheckpointsEditor then
-              showingCheckpointsEditor = true
-            else
-              race.checkpointIndexs = nil
-              showingCheckpointsEditor = false
-            end
-          end
-          showCheckpointsEditor(race)
-        end
-
-      end
-
-      local function triggerExists(prefix, raceName)
-        return scenetree.findObject(prefix .. raceName) ~= nil
+        triggerButton("pit", "Pit Trigger", currentRaceName)
+        
+        im.Unindent()
       end
       
-      -- SECTION: Trigger Management
-      if im.CollapsingHeader1("Trigger Management") then
-        -- Start trigger
-        local startExists = triggerExists("fre_start_", currentRaceName)
-        local buttonText = startExists and "Select Start Trigger" or "Create Start Trigger"
-        if pendingTriggerType == "start" and pendingTriggerRace == currentRaceName then
-          buttonText = "Cancel Start Trigger Placement"
-        end
-        
-        im.PushStyleColor2(im.Col_Text, startExists and im.ImVec4(0.2, 0.8, 0.2, 1.0) or im.ImVec4(0.8, 0.2, 0.2, 1.0))
-        if im.Button(buttonText, im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
-          if pendingTriggerType == "start" and pendingTriggerRace == currentRaceName then
-            -- Cancel placement
-            pendingTriggerType = nil
-            pendingTriggerRace = nil
-            showTriggerPlacementHelp = false
-          else
-            createOrSelectTrigger("start", currentRaceName)
-          end
-        end
-        im.PopStyleColor()
-
-        -- Staging trigger
-        local stagingExists = triggerExists("fre_staging_", currentRaceName)
-        buttonText = stagingExists and "Select Staging Trigger" or "Create Staging Trigger"
-        if pendingTriggerType == "staging" and pendingTriggerRace == currentRaceName then
-          buttonText = "Cancel Staging Trigger Placement"
-        end
-        
-        im.PushStyleColor2(im.Col_Text, stagingExists and im.ImVec4(0.2, 0.8, 0.2, 1.0) or im.ImVec4(0.8, 0.2, 0.2, 1.0))
-        if im.Button(buttonText, im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
-          if pendingTriggerType == "staging" and pendingTriggerRace == currentRaceName then
-            -- Cancel placement
-            pendingTriggerType = nil
-            pendingTriggerRace = nil
-            showTriggerPlacementHelp = false
-          else
-            createOrSelectTrigger("staging", currentRaceName)
-          end
-        end
-        im.PopStyleColor()
-
-        -- Finish trigger (only for point-to-point races)
-        if not race.hotlap then
-          local finishExists = triggerExists("fre_finish_", currentRaceName)
-          buttonText = finishExists and "Select Finish Trigger" or "Create Finish Trigger"
-          if pendingTriggerType == "finish" and pendingTriggerRace == currentRaceName then
-            buttonText = "Cancel Finish Trigger Placement"
-          end
-          
-          im.PushStyleColor2(im.Col_Text, finishExists and im.ImVec4(0.2, 0.8, 0.2, 1.0) or im.ImVec4(0.8, 0.2, 0.2, 1.0))
-          if im.Button(buttonText, im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
-            if pendingTriggerType == "finish" and pendingTriggerRace == currentRaceName then
-              -- Cancel placement
-              pendingTriggerType = nil
-              pendingTriggerRace = nil
-              showTriggerPlacementHelp = false
-            else
-              createOrSelectTrigger("finish", currentRaceName)
-            end
-          end
-          im.PopStyleColor()
-        end
-        
-        -- Show help text if placing trigger
-        if showTriggerPlacementHelp then
-          im.TextColored(im.ImVec4(1, 1, 0, 1), "Click on the map to place the trigger")
-        end
-      end
+      -- ===== TESTING =====
+      im.SeparatorText("Testing")
       
-      -- SECTION: Pits Management
-      if im.CollapsingHeader1("Pits Management") then
-        -- Enable/disable pits toggle
-        local hasPits = im.BoolPtr(race.hasPits or false)
-        if im.Checkbox("Enable Pit Lane Speed Limit", hasPits) then
-          race.hasPits = hasPits[0]
-          changed = true
-        end
-        
-        -- Only show pit settings if enabled
-        if race.hasPits then
-          -- Speed limit value
-          local pitSpeedLimit = im.IntPtr(race.pitSpeedLimit or 60)
-          if im.InputInt("Pit Speed Limit", pitSpeedLimit, 5, 10) then
-            race.pitSpeedLimit = math.max(5, pitSpeedLimit[0]) -- Ensure minimum value
-            changed = true
-          end
-          
-          -- Speed limit unit selection using BeginCombo
-          local unitOptions = {"KPH", "MPH"}
-          local currentUnit = race.pitSpeedUnit or "KPH"
-          
-          if im.BeginCombo("Speed Unit", currentUnit) then
-            for _, unit in ipairs(unitOptions) do
-              local isSelected = (unit == currentUnit)
-              if im.Selectable1(unit, isSelected) then
-                race.pitSpeedUnit = unit
-                changed = true
-              end
-              
-              -- Set initial focus when opening the combo
-              if isSelected then
-                im.SetItemDefaultFocus()
-              end
-            end
-            im.EndCombo()
-          end
-          
-          -- Pit trigger
-          local pitExists = triggerExists("fre_pits_", currentRaceName)
-          local buttonText = pitExists and "Select Pit Trigger" or "Create Pit Trigger"
-          if pendingTriggerType == "pit" and pendingTriggerRace == currentRaceName then
-            buttonText = "Cancel Pit Trigger Placement"
-          end
-          
-          im.PushStyleColor2(im.Col_Text, pitExists and im.ImVec4(0.2, 0.8, 0.2, 1.0) or im.ImVec4(0.8, 0.2, 0.2, 1.0))
-          if im.Button(buttonText, im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
-            if pendingTriggerType == "pit" and pendingTriggerRace == currentRaceName then
-              -- Cancel placement
-              pendingTriggerType = nil
-              pendingTriggerRace = nil
-              showTriggerPlacementHelp = false
-            else
-              createOrSelectTrigger("pit", currentRaceName)
-            end
-          end
-          im.PopStyleColor()
-        end
+      if im.Button("Teleport to Start", im.ImVec2(im.GetContentRegionAvail().x, 30)) then
+        teleportToStart(currentRaceName)
       end
+      helpMarker("Teleports your vehicle to the start trigger position", true)
       
-      -- SECTION: Actions
-      if im.Button("Delete Event", im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
+      -- ===== ACTIONS =====
+      im.SeparatorText("Actions")
+      
+      im.PushStyleColor2(im.Col_Button, im.ImVec4(0.6, 0.1, 0.1, 1))
+      if im.Button("Delete Event", im.ImVec2(im.GetContentRegionAvail().x, 30)) then
         im.OpenPopup("Delete Event Confirmation")
       end
+      im.PopStyleColor()
       
+      -- Delete confirmation modal
       if im.BeginPopupModal("Delete Event Confirmation", nil, im.WindowFlags_AlwaysAutoResize) then
         im.Text("Are you sure you want to delete this event?")
+        im.TextColored(colors.warning, race.label or currentRaceName)
         im.Text("This action cannot be undone.")
         im.Separator()
         
-        if im.Button("Yes, Delete Event", im.ImVec2(im.GetContentRegionAvailWidth()/2, 0)) then
+        im.PushStyleColor2(im.Col_Button, im.ImVec4(0.6, 0.1, 0.1, 1))
+        if im.Button("Yes, Delete", im.ImVec2(im.GetContentRegionAvail().x * 0.48, 0)) then
           races[currentRaceName] = nil
           currentRaceName = nil
           changed = true
           im.CloseCurrentPopup()
         end
+        im.PopStyleColor()
         
         im.SameLine()
         
-        if im.Button("Cancel", im.ImVec2(im.GetContentRegionAvailWidth(), 0)) then
+        if im.Button("Cancel", im.ImVec2(im.GetContentRegionAvail().x, 0)) then
           im.CloseCurrentPopup()
         end
         
@@ -1148,78 +1806,72 @@ local function onEditorGui()
       if changed then
         modified = true
       end
+    else
+      -- No event selected
+      im.TextColored(colors.dimmed, "Select an event from the list or create a new one")
     end
+    
+    im.EndChild()
     
     editor.endWindow()
   end
 end
 
--- Helper function to check if a value exists in a table
-local function tableContains(table, val)
-  if not table then return false end
-  for _, v in ipairs(table) do
-    if v == val then return true end
+-- ============================================================================
+-- UPDATE LOOP
+-- ============================================================================
+
+local internal_onEditorUpdate = 5
+local lastOsTime = os.time()
+
+function M.onEditorUpdate()
+  -- Trigger placement
+  if pendingTriggerType and pendingTriggerRace then
+    triggerPlacementUpdate()
   end
-  return false
+  
+  -- Draw road path
+  drawRoadPath()
+  
+  -- Periodic refresh
+  if os.time() - lastOsTime > internal_onEditorUpdate then
+    lastOsTime = os.time()
+    findDecalRoads()
+
+    -- Validate checkpoint roads still exist
+    for raceName, race in pairs(races) do
+      if race.checkpointRoad then
+        if type(race.checkpointRoad) == "string" then
+          if race.checkpointRoad ~= "" and not tableContains(levelDecalRoads, race.checkpointRoad) then
+            -- Road doesn't exist - mark but don't auto-clear
+          end
+        elseif type(race.checkpointRoad) == "table" then
+          -- Just validate, don't auto-remove
+        end
+      end
+    end
+  end
 end
 
--- Called when editor activates this tool
+-- ============================================================================
+-- LIFECYCLE
+-- ============================================================================
+
 local function onActivate()
   log('I', logTag, "Freeroam Event Editor activated")
   findLevelObjects()
 end
 
--- Window menu item callback
 local function onWindowMenuItem()
   editor.showWindow(toolWindowName)
 end
 
--- Called when editor initializes
 local function onEditorInitialized()
-  editor.registerWindow(toolWindowName, im.ImVec2(600, 600))
+  editor.registerWindow(toolWindowName, im.ImVec2(900, 700))
   editor.addWindowMenuItem("Freeroam Event Editor", onWindowMenuItem)
   log('I', logTag, "Freeroam Event Editor initialized")
   loadRaceData()
   findLevelObjects()
-end
-
-local internal_onEditorUpdate = 5
-local lastOsTime = os.time()
-
--- Add onEditorUpdate function for our trigger placement
-function M.onEditorUpdate()
-  if pendingTriggerType and pendingTriggerRace then
-    triggerPlacementUpdate()
-  end
-  if os.time() - lastOsTime > internal_onEditorUpdate then
-    lastOsTime = os.time()
-    findDecalRoads()
-
-    for raceName, race in pairs(races) do
-      if race.checkpointRoad then
-        -- Handle both string and table cases
-        if type(race.checkpointRoad) == "string" then
-          -- Legacy format (single road as string)
-          if race.checkpointRoad ~= "" and not tableContains(levelDecalRoads, race.checkpointRoad) then
-            race.checkpointRoad = nil
-          end
-        elseif type(race.checkpointRoad) == "table" then
-          -- New format (multiple roads as table)
-          local validRoads = {}
-          for _, roadName in ipairs(race.checkpointRoad) do
-            if roadName ~= "" and tableContains(levelDecalRoads, roadName) then
-              table.insert(validRoads, roadName)
-            end
-          end
-          
-          -- Only update if we need to remove some roads
-          if #validRoads ~= #race.checkpointRoad then
-            race.checkpointRoad = validRoads  -- Always keep as table, even if empty
-          end
-        end
-      end
-    end
-  end
 end
 
 local function onExtensionLoaded()
@@ -1233,10 +1885,15 @@ local function onWorldReadyState(state)
   end
 end
 
+-- ============================================================================
+-- MODULE EXPORTS
+-- ============================================================================
+
 M.onEditorGui = onEditorGui
 M.onEditorInitialized = onEditorInitialized
 M.onWindowMenuItem = onWindowMenuItem
 M.onActivate = onActivate
 M.onExtensionLoaded = onExtensionLoaded
+M.onWorldReadyState = onWorldReadyState
 
-return M 
+return M
