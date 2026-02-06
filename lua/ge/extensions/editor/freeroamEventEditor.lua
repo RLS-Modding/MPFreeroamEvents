@@ -665,6 +665,62 @@ local function deleteTrigger(triggerType, raceName)
   end
 end
 
+local function cloneTriggerAs(sourceType, targetType, raceName)
+  if not raceName then return end
+  
+  local sourcePrefix = sourceType == "start" and "fre_start_" or "fre_staging_"
+  local targetPrefix = targetType == "start" and "fre_start_" or "fre_staging_"
+  
+  local sourceTrigger = scenetree.findObject(sourcePrefix .. raceName)
+  if not sourceTrigger then
+    editor.showNotification("Source trigger not found")
+    return
+  end
+  
+  local pos = sourceTrigger:getPosition()
+  local rot = sourceTrigger:getRotation()
+  local scale = sourceTrigger:getScale()
+  
+  -- Offset the clone along the trigger's forward direction
+  -- Staging goes behind start, start goes ahead of staging
+  local fwd = rot * vec3(0, 1, 0) -- trigger's forward axis
+  local spacing = math.max(scale.x, scale.y) + 5 -- trigger size + gap
+  if targetType == "staging" then
+    -- Staging behind start: offset backward
+    pos = pos - fwd * spacing
+  else
+    -- Start ahead of staging: offset forward
+    pos = pos + fwd * spacing
+  end
+  
+  local triggerName = targetPrefix .. raceName
+  local obj = worldEditorCppApi.createObject("BeamNGTrigger")
+  if obj then
+    obj:setName(triggerName)
+    obj:registerObject("")
+    obj:setPosition(pos)
+    obj:setRotation(rot)
+    obj:setScale(scale)
+    
+    -- Add to same parent group as source
+    local sourceGroup = sourceTrigger:getGroup()
+    if sourceGroup then
+      sourceGroup:addObject(obj)
+    else
+      local parent = scenetree.MissionGroup
+      if parent then parent:addObject(obj) end
+    end
+    
+    if levelTriggers then
+      table.insert(levelTriggers, triggerName)
+    end
+    
+    editor.selectObjectById(obj:getID())
+    editor.showNotification("Cloned " .. sourceType .. " as " .. targetType .. " trigger")
+    log('I', logTag, "Cloned trigger: " .. sourcePrefix .. raceName .. " -> " .. triggerName)
+  end
+end
+
 -- ============================================================================
 -- CHECKPOINTS EDITOR
 -- ============================================================================
@@ -1175,8 +1231,20 @@ local function drawTriggerInfo(triggerType, raceName)
       info.position.x, info.position.y, info.position.z))
     im.TextColored(colors.dimmed, string.format("Scale: %.1f x %.1f x %.1f", 
       info.scale.x, info.scale.y, info.scale.z))
-    -- Delete button (not for finish on non-hotlap, it's required)
+    -- Clone button: clone start as staging (offset behind) or staging as start (offset ahead)
     if triggerType == "start" or triggerType == "staging" then
+      local otherType = triggerType == "start" and "staging" or "start"
+      local otherPrefix = triggerType == "start" and "fre_staging_" or "fre_start_"
+      local otherExists = scenetree.findObject(otherPrefix .. raceName) ~= nil
+      if not otherExists then
+        im.SameLine()
+        if im.SmallButton("Clone as " .. otherType .. "##clone_" .. triggerType) then
+          cloneTriggerAs(triggerType, otherType, raceName)
+        end
+        if im.IsItemHovered() then
+          im.SetTooltip("Clone this trigger as the " .. otherType .. " trigger with spacing offset")
+        end
+      end
       im.SameLine()
       im.PushStyleColor2(im.Col_Button, im.ImVec4(0.5, 0.1, 0.1, 1))
       if im.SmallButton("Delete##del_" .. triggerType) then
