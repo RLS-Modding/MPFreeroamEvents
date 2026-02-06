@@ -838,6 +838,36 @@ end
 -- REWARD CURVE VISUALIZATION
 -- ============================================================================
 
+--- Format a dollar amount as a readable string (no scientific notation)
+local function formatMoney(amount)
+  amount = math.floor(amount + 0.5)
+  if amount >= 1000000 then
+    return string.format("$%.1fM", amount / 1000000)
+  elseif amount >= 1000 then
+    return string.format("$%dk", math.floor(amount / 1000))
+  else
+    return string.format("$%d", amount)
+  end
+end
+
+--- Draw a PlotLines graph with readable Y-axis labels instead of scientific notation
+local function drawPlot(label, dataTable, overlayMax, graphHeight)
+  local data = im.TableToArrayFloat(dataTable)
+  local dataLen = im.GetLengthArrayFloat(data)
+  local scaleMax = math.max(overlayMax * 1.1, 1)
+  
+  -- Draw the plot with no overlay text (we'll add our own labels)
+  im.PlotLines1(label, data, dataLen, 0, "", 0, scaleMax, im.ImVec2(im.GetContentRegionAvail().x, graphHeight))
+  
+  -- Draw Y-axis labels above the graph
+  local cursorY = im.GetCursorPosY()
+  im.SetCursorPosY(cursorY - graphHeight - 2)
+  im.TextColored(colors.dimmed, formatMoney(overlayMax))
+  im.SetCursorPosY(cursorY - 18)
+  im.TextColored(colors.dimmed, "$0")
+  im.SetCursorPosY(cursorY)
+end
+
 local function drawRewardCurve(race)
   if not race.bestTime or not race.reward then return end
   
@@ -874,11 +904,8 @@ local function drawRewardCurve(race)
       if reward > maxDamageReward then maxDamageReward = reward end
     end
     
-    im.Text("Reward vs Time (at current damage %)")
-    local timeData = im.TableToArrayFloat(timeTable)
-    im.PlotLines1("##RewardTime", timeData, im.GetLengthArrayFloat(timeData), 0, 
-      string.format("Max $%.0f", maxReward), 0, math.max(maxReward * 1.1, 1), 
-      im.ImVec2(im.GetContentRegionAvail().x, 120))
+    im.Text(string.format("Reward vs Time (at %.0f%% damage, factor: %.2f)", damagePercentage[0] * 100, race.damageFactor))
+    drawPlot("##RewardTime", timeTable, maxReward, 120)
     im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
     im.SameLine()
     im.SetCursorPosX(im.GetContentRegionAvail().x * 0.45)
@@ -889,21 +916,19 @@ local function drawRewardCurve(race)
     
     im.Spacing()
     
-    im.Text("Reward vs Damage (at current time)")
-    local damageData = im.TableToArrayFloat(damageTable)
-    im.PlotLines1("##RewardDamage", damageData, im.GetLengthArrayFloat(damageData), 0, 
-      string.format("Max $%.0f", maxDamageReward), 0, math.max(maxDamageReward * 1.1, 1), 
-      im.ImVec2(im.GetContentRegionAvail().x, 120))
+    local previewTime = realTime[0] > 0 and realTime[0] or race.bestTime
+    im.Text(string.format("Reward vs Damage (at %.1fs, factor: %.2f)", previewTime, race.damageFactor))
+    drawPlot("##RewardDamage", damageTable, maxDamageReward, 120)
     im.TextColored(colors.dimmed, "0% damage")
     im.SameLine()
     im.SetCursorPosX(im.GetContentRegionAvail().x * 0.85)
     im.TextColored(colors.dimmed, "100% damage")
     
-    -- Preview
+    -- Preview with readable numbers
     local previewReward = utils.hybridRaceReward(race.bestTime, race.reward, realTime[0], race.damageFactor, damagePercentage[0], race.type)
     previewReward = math.min(previewReward, rewardCap)
-    im.TextColored(colors.info, string.format("Preview: %.1fs at %.0f%% damage = $%.0f", realTime[0], damagePercentage[0] * 100, previewReward))
-    im.TextColored(colors.dimmed, string.format("Reward cap: $%.0f", rewardCap))
+    im.TextColored(colors.info, string.format("Preview: %.1fs at %.0f%% damage = %s", realTime[0], damagePercentage[0] * 100, formatMoney(previewReward)))
+    im.TextColored(colors.dimmed, string.format("Reward cap: %s | Base: %s", formatMoney(rewardCap), formatMoney(race.reward)))
     return
   end
   
@@ -932,10 +957,7 @@ local function drawRewardCurve(race)
     previewReward = math.min(previewReward, rewardCap)
     
     im.Text("Reward Curve (Speed vs Reward)")
-    local rewardData = im.TableToArrayFloat(rewardTable)
-    im.PlotLines1("##RewardCurve", rewardData, im.GetLengthArrayFloat(rewardData), 0,
-      string.format("Max $%.0f", maxReward), 0, math.max(maxReward * 1.1, 1),
-      im.ImVec2(im.GetContentRegionAvail().x, 150))
+    drawPlot("##RewardCurve", rewardTable, maxReward, 150)
     im.TextColored(colors.dimmed, string.format("%.0f mph", (race.topSpeedGoal or 100) * 0.5))
     im.SameLine()
     im.SetCursorPosX(im.GetContentRegionAvail().x * 0.4)
@@ -943,7 +965,7 @@ local function drawRewardCurve(race)
     im.SameLine()
     im.SetCursorPosX(im.GetContentRegionAvail().x * 0.85)
     im.TextColored(colors.dimmed, string.format("%.0f mph", (race.topSpeedGoal or 100) * 2))
-    im.TextColored(colors.info, string.format("Preview: %.0f mph = $%.0f", topSpeedPreview[0], previewReward))
+    im.TextColored(colors.info, string.format("Preview: %.0f mph = %s", topSpeedPreview[0], formatMoney(previewReward)))
   else
     -- Time-based (standard or drift)
     minTime = race.bestTime * 0.5
@@ -971,10 +993,7 @@ local function drawRewardCurve(race)
     previewReward = math.min(previewReward, rewardCap)
     
     im.Text("Reward Curve (Time vs Reward)")
-    local rewardData = im.TableToArrayFloat(rewardTable)
-    im.PlotLines1("##RewardCurve", rewardData, im.GetLengthArrayFloat(rewardData), 0,
-      string.format("Max $%.0f", maxReward), 0, math.max(maxReward * 1.1, 1),
-      im.ImVec2(im.GetContentRegionAvail().x, 150))
+    drawPlot("##RewardCurve", rewardTable, maxReward, 150)
     im.TextColored(colors.dimmed, string.format("%.1fs", minTime))
     im.SameLine()
     im.SetCursorPosX(im.GetContentRegionAvail().x * 0.45)
@@ -982,10 +1001,10 @@ local function drawRewardCurve(race)
     im.SameLine()
     im.SetCursorPosX(im.GetContentRegionAvail().x * 0.85)
     im.TextColored(colors.dimmed, string.format("%.1fs", maxTime))
-    im.TextColored(colors.info, string.format("Preview: %.1fs = $%.0f", realTime[0], previewReward))
+    im.TextColored(colors.info, string.format("Preview: %.1fs = %s", realTime[0], formatMoney(previewReward)))
   end
   
-  im.TextColored(colors.dimmed, string.format("Reward cap: $%.0f", rewardCap))
+  im.TextColored(colors.dimmed, string.format("Reward cap: %s", formatMoney(rewardCap)))
 end
 
 -- ============================================================================
