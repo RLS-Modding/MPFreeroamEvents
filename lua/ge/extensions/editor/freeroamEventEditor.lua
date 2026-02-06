@@ -590,9 +590,13 @@ end
 local function teleportToStart(raceName)
   if not raceName then return end
   
+  local stagingTrigger = scenetree.findObject("fre_staging_" .. raceName)
   local startTrigger = scenetree.findObject("fre_start_" .. raceName)
-  if not startTrigger then
-    editor.showNotification("No start trigger found for this event")
+  
+  -- Need at least one trigger to teleport to
+  local targetTrigger = stagingTrigger or startTrigger
+  if not targetTrigger then
+    editor.showNotification("No staging or start trigger found for this event")
     return
   end
   
@@ -602,14 +606,63 @@ local function teleportToStart(raceName)
     return
   end
   
-  local pos = startTrigger:getPosition()
-  local rot = startTrigger:getRotation()
+  if stagingTrigger and startTrigger then
+    -- Both exist: position behind staging, facing toward start
+    local stagingPos = stagingTrigger:getPosition()
+    local startPos = startTrigger:getPosition()
+    
+    -- Direction from staging to start
+    local dir = (startPos - stagingPos)
+    dir.z = 0
+    dir = dir:normalized()
+    
+    -- Place vehicle behind staging (offset back along the approach direction)
+    local stagingScale = stagingTrigger:getScale()
+    local offset = math.max(stagingScale.x, stagingScale.y) + 8 -- behind staging zone + some room
+    local spawnPos = stagingPos - dir * offset + vec3(0, 0, 1)
+    
+    -- Build rotation quaternion facing toward start (along dir)
+    -- BeamNG uses Y-forward convention for vehicles
+    local up = vec3(0, 0, 1)
+    local rot = quatFromDir(dir, up)
+    
+    playerVeh:setPositionRotation(spawnPos.x, spawnPos.y, spawnPos.z, rot.x, rot.y, rot.z, rot.w)
+    editor.showNotification("Teleported behind staging, facing start")
+  else
+    -- Only one trigger exists, teleport near it with its rotation
+    local pos = targetTrigger:getPosition() + vec3(0, 0, 1)
+    local rot = targetTrigger:getRotation()
+    playerVeh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
+    editor.showNotification("Teleported to " .. (stagingTrigger and "staging" or "start") .. " trigger")
+  end
+end
+
+local function deleteTrigger(triggerType, raceName)
+  if not raceName then return end
   
-  -- Offset slightly above ground
-  pos = pos + vec3(0, 0, 1)
+  local prefix
+  if triggerType == "start" then prefix = "fre_start_"
+  elseif triggerType == "staging" then prefix = "fre_staging_"
+  elseif triggerType == "finish" then prefix = "fre_finish_"
+  elseif triggerType == "pit" then prefix = "fre_pits_"
+  end
   
-  playerVeh:setPositionRotation(pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, rot.w)
-  editor.showNotification("Teleported to start trigger")
+  local triggerName = prefix .. raceName
+  local trigger = scenetree.findObject(triggerName)
+  if trigger then
+    trigger:delete()
+    -- Remove from cached trigger list
+    if levelTriggers then
+      for i, name in ipairs(levelTriggers) do
+        if name == triggerName then
+          table.remove(levelTriggers, i)
+          break
+        end
+      end
+    end
+    editor.showNotification("Deleted " .. triggerType .. " trigger")
+    log('I', logTag, "Deleted trigger: " .. triggerName)
+  end
 end
 
 -- ============================================================================
@@ -1122,6 +1175,15 @@ local function drawTriggerInfo(triggerType, raceName)
       info.position.x, info.position.y, info.position.z))
     im.TextColored(colors.dimmed, string.format("Scale: %.1f x %.1f x %.1f", 
       info.scale.x, info.scale.y, info.scale.z))
+    -- Delete button (not for finish on non-hotlap, it's required)
+    if triggerType == "start" or triggerType == "staging" then
+      im.SameLine()
+      im.PushStyleColor2(im.Col_Button, im.ImVec4(0.5, 0.1, 0.1, 1))
+      if im.SmallButton("Delete##del_" .. triggerType) then
+        deleteTrigger(triggerType, raceName)
+      end
+      im.PopStyleColor()
+    end
     im.Unindent()
   end
 end
